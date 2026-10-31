@@ -246,6 +246,8 @@ def build_three_stage_documents(request_data, participants):
         "2 éme année Licence": r.get("promotion",""),
         "Electrotechnique": "Electrotechnique",
         "MCIL Electrotechnique": r.get("promotion",""),
+        # Date de signature de la convention : date réelle de génération du document.
+        "22-04-2026": datetime.now().strftime("%d-%m-%Y"),
         "22/03/2026": start, "04/04/2026": end,
         "Sonatrach/division Production-Direction Régionale Ouagla-hassi Messaoud": company,
         "Sonatrach/division Production-Direction Régionale": company,
