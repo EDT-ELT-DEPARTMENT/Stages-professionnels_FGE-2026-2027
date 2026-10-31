@@ -230,12 +230,18 @@ def build_three_stage_documents(request_data, participants):
     wilaya = r.get("wilaya_entreprise", "")
     start, end = r.get("date_debut",""), r.get("date_fin","")
     period = f"du {start} au {end}".strip()
+    # L'adresse et le matricule sont pris dans les données corrigées de l'étudiant.
+    domicile = (primary_student.get("adresse_domicile") or r.get("adresse_domicile") or "")
+    matricule = (primary_student.get("matricule") or r.get("matricule") or "")
     replacements = {
-        "ablasaoudi99@gmail.com": r.get("email",""), "666187646": r.get("telephone",""),
+        "ablasaoudi99@gmail.com": primary_student.get("email") or r.get("email", ""),
+        "666187646": primary_student.get("telephone") or r.get("telephone", ""),
         "Nom : saoudi": f'Nom : {r.get("nom","")}',
         "Nom\xa0: saoudi": f'Nom : {r.get("nom","")}',
         "Prénom : abla": f'Prénom : {r.get("prenom","")}',
-        "Hassi Messaoud-Ouargla": r.get("wilaya_residence",""),
+        # Ne jamais remplacer l'adresse du domicile par la wilaya de résidence.
+        "Adresse : Hassi Messaoud-Ouargla": f"Adresse : {domicile}",
+        "Adresse : Hassi Messaoud-Ouargla": f"Adresse : {domicile}",
         "2025-2026": "2026-2027",
         "2 éme année Licence": r.get("promotion",""),
         "Electrotechnique": "Electrotechnique",
@@ -245,7 +251,9 @@ def build_three_stage_documents(request_data, participants):
         "Sonatrach/division Production-Direction Régionale": company,
         "EL BGUEL.BP 113": address, "HASSI MESSAOUD /OUARGLA": wilaya,
         "saoudi abla": full_name,
-        "09/09/2005": r.get("date_naissance",""),
+        "Inscrit (e) sous le Numéro.   …………………   .pour l’année universitaire 2025-2026:":
+            f"Inscrit (e) sous le Numéro.   {matricule}   .pour l’année universitaire 2026-2027:",
+        "09/09/2005": r.get("date_naissance", primary_student.get("date_naissance", "")),
         "Mchedallah /Bouira": r.get("lieu_naissance",""),
         "sontrach/division Production-Direction Régionale": company,
         "(nombres d’étudiants)": str(1 + len(participants)),
