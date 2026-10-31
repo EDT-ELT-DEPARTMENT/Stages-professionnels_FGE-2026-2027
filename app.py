@@ -308,6 +308,8 @@ def init_db():
             "date_naissance": "TEXT", "lieu_naissance": "TEXT",
             "adresse_domicile": "TEXT", "ccp_number": "TEXT", "cheque_barre": "BLOB",
             "enseignant_superviseur": "TEXT", "programme_stage": "TEXT",
+            # Masquage de l'affichage historique sans supprimer les décisions validées.
+            "historique_efface": "INTEGER DEFAULT 0",
         }
         for col, typ in migrations.items():
             if col not in cols: con.execute(f"ALTER TABLE demandes ADD COLUMN {col} {typ}")
@@ -616,6 +618,67 @@ if page == "Demande de stage":
         if found.empty: st.error("Matricule introuvable dans le fichier source.")
         else:
             main_student = student_record(found.iloc[0])
+
+            # Vérification automatique des avis favorables déjà accordés.
+            # Le contrôle couvre le demandeur principal ainsi que les participants
+            # enregistrés dans les demandes groupées.
+            matricule_key = normalize_matricule(main_student["matricule"])
+            favorable_previous_requests = []
+            with sqlite3.connect(DB_FILE) as con:
+                con.row_factory = sqlite3.Row
+                favorable_rows = con.execute("""
+                    SELECT id, matricule, nom, prenom, promotion, entreprise,
+                           sujet_stage, vice_dean_avis, vice_dean_date,
+                           vice_dean_comment, statut, participants_json
+                    FROM demandes
+                    WHERE TRIM(COALESCE(vice_dean_avis, '')) = 'Avis favorable'
+                      AND COALESCE(type_demande, 'Stage rémunéré') = 'Stage rémunéré'
+                    ORDER BY id DESC
+                """).fetchall()
+
+            for previous_row in favorable_rows:
+                previous = dict(previous_row)
+                found_in_previous = (
+                    normalize_matricule(previous.get("matricule", "")) == matricule_key
+                )
+                if not found_in_previous:
+                    try:
+                        previous_participants = json.loads(
+                            previous.get("participants_json") or "[]"
+                        )
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        previous_participants = []
+                    if isinstance(previous_participants, list):
+                        found_in_previous = any(
+                            isinstance(participant, dict)
+                            and normalize_matricule(participant.get("matricule", "")) == matricule_key
+                            for participant in previous_participants
+                        )
+                if found_in_previous:
+                    favorable_previous_requests.append(previous)
+
+            if favorable_previous_requests:
+                previous = favorable_previous_requests[0]
+                st.error(
+                    "⛔ Un avis favorable a déjà été accordé pour ce matricule. "
+                    "Le dépôt d'une nouvelle demande de stage rémunéré est bloqué."
+                )
+                st.warning(
+                    f"**Étudiant :** {main_student['nom']} {main_student['prenom']}  \\n"
+                    f"**Matricule :** {main_student['matricule']}  \\n"
+                    f"**Dossier précédent :** STG-{int(previous['id']):05d}"
+                )
+                st.write(f"**Organisme d'accueil :** {previous.get('entreprise') or 'Non renseigné'}")
+                st.write(f"**Sujet du stage :** {previous.get('sujet_stage') or 'Non renseigné'}")
+                st.write(f"**Date de l'avis favorable :** {previous.get('vice_dean_date') or 'Non renseignée'}")
+                if previous.get("vice_dean_comment"):
+                    st.write(f"**Observation :** {previous['vice_dean_comment']}")
+                st.info(
+                    "Si cet avis favorable a été enregistré par erreur ou a été retiré "
+                    "par l'administration, veuillez contacter le service responsable."
+                )
+                st.stop()
+
             if norm_promo(main_student["promotion"]) not in PROMOTIONS_STAGE_REMUNERE:
                 st.warning(f"Votre promotion ({main_student['promotion']}) n'est pas éligible au stage rémunéré. Vous êtes orienté(e) vers la visite en entreprise.")
                 st.info("La demande groupée de stage rémunéré est réservée aux promotions autorisées. Pour une visite, utilisez la procédure correspondante.")
@@ -889,6 +952,89 @@ elif page == "Administration":
                 wilaya_residence,ville_naissance,wilaya_naissance,date_naissance,lieu_naissance,enseignant_superviseur,programme_stage,
                 entreprise,sujet_stage,type_demande,statut,participants_json FROM demandes ORDER BY id DESC""",con)
         st.metric("Nombre total de demandes",len(data))
+
+        # Tableau de bord des avis favorables. Le masquage de l'historique ne
+        # supprime jamais les décisions de la base : elles continuent à bloquer
+        # automatiquement une nouvelle demande pour les matricules concernés.
+        with sqlite3.connect(DB_FILE) as con:
+            approved_data = pd.read_sql_query("""SELECT id, date_soumission, matricule, nom, prenom,
+                promotion, entreprise, sujet_stage, vice_dean_date, vice_dean_comment,
+                participants_json, COALESCE(historique_efface, 0) AS historique_efface
+                FROM demandes
+                WHERE TRIM(COALESCE(vice_dean_avis, '')) = 'Avis favorable'
+                  AND COALESCE(type_demande, 'Stage rémunéré') = 'Stage rémunéré'
+                ORDER BY id DESC""", con)
+
+        visible_approved = approved_data[approved_data["historique_efface"] == 0].copy() if not approved_data.empty else approved_data.copy()
+        approved_people = []
+        for _, approved in visible_approved.iterrows():
+            ref = f"STG-{int(approved['id']):05d}"
+            main_key = normalize_matricule(approved.get("matricule", ""))
+            if main_key:
+                approved_people.append({
+                    "Référence": ref, "Matricule": approved.get("matricule", ""),
+                    "Nom": approved.get("nom", ""), "Prénom": approved.get("prenom", ""),
+                    "Promotion": approved.get("promotion", ""),
+                    "Organisme d'accueil": approved.get("entreprise", ""),
+                    "Sujet du stage": approved.get("sujet_stage", ""),
+                    "Date de l'avis favorable": approved.get("vice_dean_date", ""),
+                    "Observation": approved.get("vice_dean_comment", ""),
+                })
+            try:
+                participants = json.loads(approved.get("participants_json") or "[]")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                participants = []
+            if isinstance(participants, list):
+                for participant in participants:
+                    if not isinstance(participant, dict):
+                        continue
+                    participant_key = normalize_matricule(participant.get("matricule", ""))
+                    if not participant_key or participant_key == main_key:
+                        continue
+                    approved_people.append({
+                        "Référence": ref, "Matricule": participant.get("matricule", ""),
+                        "Nom": participant.get("nom", ""), "Prénom": participant.get("prenom", ""),
+                        "Promotion": participant.get("promotion", approved.get("promotion", "")),
+                        "Organisme d'accueil": approved.get("entreprise", ""),
+                        "Sujet du stage": approved.get("sujet_stage", ""),
+                        "Date de l'avis favorable": approved.get("vice_dean_date", ""),
+                        "Observation": approved.get("vice_dean_comment", ""),
+                    })
+
+        approved_people_df = pd.DataFrame(approved_people, columns=[
+            "Référence", "Matricule", "Nom", "Prénom", "Promotion",
+            "Organisme d'accueil", "Sujet du stage", "Date de l'avis favorable", "Observation"
+        ])
+        if not approved_people_df.empty:
+            approved_people_df = approved_people_df.drop_duplicates(subset=["Matricule"])
+        st.markdown("### 🎓 Demandeurs ayant obtenu un avis favorable")
+        st.metric("Nombre de demandeurs bénéficiaires", int(len(approved_people_df)))
+        if approved_people_df.empty:
+            st.info("Aucun demandeur avec avis favorable n'est actuellement affiché dans l'historique.")
+        else:
+            st.dataframe(approved_people_df, use_container_width=True, hide_index=True)
+            approved_csv = approved_people_df.to_csv(index=False).encode("utf-8-sig")
+            st.download_button("⬇️ Exporter la liste des avis favorables (CSV)", approved_csv,
+                "Demandeurs_avis_favorables_FGE_2026-2027.csv", "text/csv")
+
+        if not approved_data.empty:
+            st.markdown("#### Gestion de l'historique des avis favorables")
+            st.caption("L'effacement masque la liste et remet le compteur d'affichage à zéro, mais conserve les décisions en base afin que le contrôle automatique des matricules continue de fonctionner.")
+            confirm_clear_history = st.checkbox(
+                "Je confirme vouloir effacer l'historique affiché des avis favorables.",
+                key="confirm_clear_favorable_history"
+            )
+            if st.button("🗑️ Effacer l'historique affiché", type="secondary",
+                         disabled=not confirm_clear_history,
+                         key="clear_favorable_history_button"):
+                with sqlite3.connect(DB_FILE) as con:
+                    con.execute("""UPDATE demandes SET historique_efface=1
+                        WHERE TRIM(COALESCE(vice_dean_avis, '')) = 'Avis favorable'
+                          AND COALESCE(type_demande, 'Stage rémunéré') = 'Stage rémunéré'""")
+                    con.commit()
+                st.success("Historique masqué. Les décisions restent conservées et les matricules restent protégés contre un nouveau dépôt.")
+                st.rerun()
+
         if data.empty: st.info("Aucune demande enregistrée.")
         else:
             def participants_label(raw):
