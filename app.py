@@ -138,8 +138,10 @@ def admin_password():
     except Exception: return os.getenv("ADMIN_PASSWORD", "")
 
 def build_request_pdf(request_data, participants):
-    """Génère le formulaire à imprimer et faire signer par l'établissement d'accueil."""
-    # Utilise une police Unicode pour que les noms arabes soient imprimables si disponible.
+    """Génère un PDF dont les cellules s'adaptent au contenu et passent sur plusieurs pages."""
+    from reportlab.platypus import LongTable, KeepTogether
+
+    # Police Unicode si disponible (accents et caractères arabes).
     arabic_font = "Helvetica"
     for font_path in [
         APP_DIR / "DejaVuSans.ttf",
@@ -154,80 +156,165 @@ def build_request_pdf(request_data, participants):
                 break
             except Exception:
                 pass
+
     buffer = io.BytesIO()
-    doc = SimpleDocTemplate(buffer, pagesize=A4, rightMargin=1.7*cm, leftMargin=1.7*cm,
-                            topMargin=1.5*cm, bottomMargin=1.5*cm)
+    page_width, page_height = A4
+    left_margin = right_margin = 1.35 * cm
+    usable_width = page_width - left_margin - right_margin
+    doc = SimpleDocTemplate(
+        buffer, pagesize=A4, rightMargin=right_margin, leftMargin=left_margin,
+        topMargin=1.35*cm, bottomMargin=1.35*cm
+    )
+
     styles = getSampleStyleSheet()
-    styles.add(ParagraphStyle(name="CenterTitle", parent=styles["Title"], alignment=TA_CENTER,
-                              textColor=colors.HexColor("#17466b"), fontSize=16, leading=20))
-    styles.add(ParagraphStyle(name="Small", parent=styles["BodyText"], fontSize=9, leading=12))
+    styles.add(ParagraphStyle(
+        name="CenterTitleFGE", parent=styles["Title"], alignment=TA_CENTER,
+        textColor=colors.HexColor("#17466b"), fontSize=14, leading=18,
+        spaceAfter=3, wordWrap="CJK"
+    ))
+    styles.add(ParagraphStyle(
+        name="SectionFGE", parent=styles["Heading2"], fontName="Helvetica-Bold",
+        fontSize=11, leading=14, textColor=colors.HexColor("#17466b"),
+        spaceBefore=7, spaceAfter=6, keepWithNext=True
+    ))
+    styles.add(ParagraphStyle(
+        name="CellFGE", fontName=arabic_font, fontSize=7.5, leading=10,
+        wordWrap="CJK", splitLongWords=1, spaceAfter=0, spaceBefore=0
+    ))
+    styles.add(ParagraphStyle(
+        name="LabelFGE", parent=styles["CellFGE"], fontName="Helvetica-Bold",
+        textColor=colors.HexColor("#173f5f")
+    ))
+    styles.add(ParagraphStyle(
+        name="HeaderFGE", parent=styles["CellFGE"], fontName="Helvetica-Bold",
+        textColor=colors.white, alignment=TA_CENTER, fontSize=7.2, leading=9
+    ))
+    styles.add(ParagraphStyle(
+        name="SmallFGE", parent=styles["BodyText"], fontSize=8, leading=11,
+        wordWrap="CJK", splitLongWords=1
+    ))
+
+    def para(value, style="CellFGE"):
+        value = "" if value is None else str(value)
+        if value.strip() == "":
+            value = "—"
+        # Évite qu'un &, < ou > présent dans les données casse le XML de Paragraph.
+        return Paragraph(html.escape(value).replace("\n", "<br/>"), styles[style])
+
+    def table_style(header=False, font_size=7.5):
+        commands = [
+            ("GRID", (0,0), (-1,-1), 0.45, colors.HexColor("#9aa9b5")),
+            ("VALIGN", (0,0), (-1,-1), "TOP"),
+            ("LEFTPADDING", (0,0), (-1,-1), 5),
+            ("RIGHTPADDING", (0,0), (-1,-1), 5),
+            ("TOPPADDING", (0,0), (-1,-1), 5),
+            ("BOTTOMPADDING", (0,0), (-1,-1), 5),
+        ]
+        if header:
+            commands += [
+                ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#17466b")),
+                ("TEXTCOLOR", (0,0), (-1,0), colors.white),
+                ("REPEAT", (0,0), (-1,0)),
+            ]
+        return TableStyle(commands)
+
     story = [
-        Paragraph("UNIVERSITÉ DJILLALI LIABÈS DE SIDI BEL ABBÈS", styles["CenterTitle"]),
-        Paragraph("FACULTÉ DE GÉNIE ÉLECTRIQUE", styles["Heading2"]),
-        Paragraph("ANNÉE UNIVERSITAIRE 2026-2027", styles["Heading3"]),
-        Spacer(1, 10),
-        Paragraph("DEMANDE DE STAGE PROFESSIONNEL RÉMUNÉRÉ", styles["CenterTitle"]),
-        Spacer(1, 12),
-        Paragraph("<b>Informations des étudiants demandeurs</b>", styles["Heading2"])
+        para("UNIVERSITÉ DJILLALI LIABÈS DE SIDI BEL ABBÈS", "CenterTitleFGE"),
+        para("FACULTÉ DE GÉNIE ÉLECTRIQUE", "SectionFGE"),
+        para("ANNÉE UNIVERSITAIRE 2026-2027", "SmallFGE"),
+        Spacer(1, 8),
+        para("DEMANDE DE STAGE PROFESSIONNEL RÉMUNÉRÉ", "CenterTitleFGE"),
+        Spacer(1, 8),
+        para("Informations des étudiants demandeurs", "SectionFGE")
     ]
-    rows = [["N° / Matricule", "Information", "Détail", "Information", "Détail"]]
-    for i, p in enumerate(participants, 1):
+
+    # Les contenus sont des Paragraph : ReportLab calcule la hauteur de chaque cellule,
+    # effectue les retours à la ligne et conserve les colonnes dans la largeur imprimable.
+    student_widths = [1.75*cm, 2.55*cm, 4.05*cm, 3.0*cm, usable_width - 11.35*cm]
+    rows = [[para(x, "HeaderFGE") for x in
+             ["N° / matricule", "Rubrique", "Détail", "Rubrique", "Détail"]]]
+    for i, student in enumerate(participants, 1):
+        get = lambda key: str(student.get(key, "") or "")
         rows.extend([
-            [f"{i} / {p['matricule']}", "Nom et prénom", (p["nom"]+" "+p["prenom"]).strip(),
-             "Nom et prénom (arabe)", (p["nom_arabe"]+" "+p["prenom_arabe"]).strip()],
-            ["", "Promotion", p["promotion"], "Groupe / Sous-groupe",
-             (p["groupe"]+" / "+p["sous_groupe"]).strip()],
-            ["", "Wilaya de résidence", p["wilaya_residence"], "Ville de naissance", p["ville_naissance"]],
-            ["", "Wilaya de naissance", p["wilaya_naissance"], "Téléphone / E-mail",
-             (p["telephone"]+" / "+p["email"]).strip()]
+            [para(f"{i} / {get('matricule')}"), para("Nom et prénom", "LabelFGE"),
+             para((get("nom")+" "+get("prenom")).strip()), para("Nom et prénom (arabe)", "LabelFGE"),
+             para((get("nom_arabe")+" "+get("prenom_arabe")).strip())],
+            [para(""), para("Promotion", "LabelFGE"), para(get("promotion")),
+             para("Groupe / Sous-groupe", "LabelFGE"),
+             para((get("groupe")+" / "+get("sous_groupe")).strip())],
+            [para(""), para("Wilaya de résidence", "LabelFGE"), para(get("wilaya_residence")),
+             para("Ville de naissance", "LabelFGE"), para(get("ville_naissance"))],
+            [para(""), para("Wilaya de naissance", "LabelFGE"), para(get("wilaya_naissance")),
+             para("Téléphone / E-mail", "LabelFGE"),
+             para((get("telephone")+" / "+get("email")).strip())]
         ])
-    t = Table(rows, colWidths=[2.0*cm, 2.6*cm, 4.0*cm, 3.0*cm, 4.0*cm], repeatRows=1)
-    t.setStyle(TableStyle([
-        ("BACKGROUND",(0,0),(-1,0),colors.HexColor("#17466b")),
-        ("TEXTCOLOR",(0,0),(-1,0),colors.white),("GRID",(0,0),(-1,-1),0.5,colors.grey),
-        ("FONTNAME",(0,0),(-1,0),"Helvetica-Bold"),("FONTNAME",(0,1),(-1,-1),arabic_font),
-        ("FONTSIZE",(0,0),(-1,-1),7),
-        ("VALIGN",(0,0),(-1,-1),"MIDDLE"),
+    student_table = LongTable(rows, colWidths=student_widths, repeatRows=1, hAlign="LEFT")
+    student_table.setStyle(table_style(header=True))
+    student_table.setStyle(TableStyle([
         ("BACKGROUND",(0,1),(0,-1),colors.HexColor("#edf3f8")),
         ("BACKGROUND",(1,1),(1,-1),colors.HexColor("#edf3f8")),
         ("BACKGROUND",(3,1),(3,-1),colors.HexColor("#edf3f8")),
-        ("TOPPADDING",(0,0),(-1,-1),5),("BOTTOMPADDING",(0,0),(-1,-1),5)
     ]))
-    story += [t, Spacer(1, 12), Paragraph("<b>Encadrement du stage</b>", styles["Heading2"])]
-    supervisor_rows = [["Enseignant superviseur (Permanent)", request_data.get("superviseur", "Non renseigné")],
-                       ["Programme détaillé du stage", request_data.get("programme", "Non renseigné")]]
-    stbl = Table(supervisor_rows, colWidths=[4.5*cm, 11.0*cm])
-    stbl.setStyle(TableStyle([("GRID",(0,0),(-1,-1),0.4,colors.grey),
-        ("BACKGROUND",(0,0),(0,-1),colors.HexColor("#edf3f8")),
-        ("FONTSIZE",(0,0),(-1,-1),8),("VALIGN",(0,0),(-1,-1),"TOP"),
-        ("TOPPADDING",(0,0),(-1,-1),7),("BOTTOMPADDING",(0,0),(-1,-1),7)]))
-    story += [stbl, Spacer(1, 12), Paragraph("<b>Entreprise d'accueil</b>", styles["Heading2"])]
+    story += [student_table, Spacer(1, 9), para("Encadrement du stage", "SectionFGE")]
+
+    supervisor_rows = [
+        [para("Enseignant superviseur (Permanent)", "LabelFGE"),
+         para(request_data.get("superviseur", "Non renseigné"))],
+        [para("Programme détaillé du stage", "LabelFGE"),
+         para(request_data.get("programme", "Non renseigné"))]
+    ]
+    supervisor_table = Table(supervisor_rows, colWidths=[4.8*cm, usable_width-4.8*cm],
+                             hAlign="LEFT")
+    supervisor_table.setStyle(table_style())
+    supervisor_table.setStyle(TableStyle([
+        ("BACKGROUND",(0,0),(0,-1),colors.HexColor("#edf3f8"))
+    ]))
+    story += [supervisor_table, Spacer(1, 9), para("Entreprise d'accueil", "SectionFGE")]
+
     fields = [
-        ["Entreprise", request_data["entreprise"], "Secteur", request_data["secteur"]],
-        ["Adresse", request_data["adresse"], "Wilaya / commune", request_data["wilaya"]],
-        ["Téléphone", request_data["tel_ent"], "E-mail", request_data["email_ent"]],
-        ["Responsable", request_data["responsable"], "Fonction", request_data["fonction"]],
+        ["Entreprise", request_data.get("entreprise",""), "Secteur", request_data.get("secteur","")],
+        ["Adresse", request_data.get("adresse",""), "Wilaya / commune", request_data.get("wilaya","")],
+        ["Téléphone", request_data.get("tel_ent",""), "E-mail", request_data.get("email_ent","")],
+        ["Responsable", request_data.get("responsable",""), "Fonction", request_data.get("fonction","")],
     ]
-    ft = Table(fields, colWidths=[2.5*cm, 6.0*cm, 2.8*cm, 4.2*cm])
-    ft.setStyle(TableStyle([("GRID",(0,0),(-1,-1),0.4,colors.grey),("BACKGROUND",(0,0),(0,-1),colors.HexColor("#edf3f8")),
-                            ("BACKGROUND",(2,0),(2,-1),colors.HexColor("#edf3f8")),("FONTSIZE",(0,0),(-1,-1),8),
-                            ("VALIGN",(0,0),(-1,-1),"TOP"),("TOPPADDING",(0,0),(-1,-1),7),("BOTTOMPADDING",(0,0),(-1,-1),7)]))
-    story += [ft, Spacer(1, 12), Paragraph("<b>Informations sur le stage</b>", styles["Heading2"])]
+    enterprise_widths = [2.4*cm, 6.0*cm, 2.8*cm, usable_width-11.2*cm]
+    enterprise_table = Table(
+        [[para(v, "LabelFGE" if j in (0,2) else "CellFGE") for j,v in enumerate(row)]
+         for row in fields],
+        colWidths=enterprise_widths, hAlign="LEFT"
+    )
+    enterprise_table.setStyle(table_style())
+    enterprise_table.setStyle(TableStyle([
+        ("BACKGROUND",(0,0),(0,-1),colors.HexColor("#edf3f8")),
+        ("BACKGROUND",(2,0),(2,-1),colors.HexColor("#edf3f8"))
+    ]))
+    story += [enterprise_table, Spacer(1, 9), para("Informations sur le stage", "SectionFGE")]
+
     details = [
-        ["Sujet / thème", request_data["sujet"]],
-        ["Service / domaine", request_data["domaine"]],
-        ["Période", f'Du {request_data["debut"]} au {request_data["fin"]}'],
-        ["Observations", request_data["observations"] or "—"],
+        ["Sujet / thème", request_data.get("sujet","")],
+        ["Service / domaine", request_data.get("domaine","")],
+        ["Période", f'Du {request_data.get("debut","")} au {request_data.get("fin","")}'],
+        ["Observations", request_data.get("observations","") or "—"],
     ]
-    dt = Table(details, colWidths=[3.5*cm, 12.0*cm])
-    dt.setStyle(TableStyle([("GRID",(0,0),(-1,-1),0.4,colors.grey),("BACKGROUND",(0,0),(0,-1),colors.HexColor("#edf3f8")),
-                            ("FONTSIZE",(0,0),(-1,-1),9),("VALIGN",(0,0),(-1,-1),"TOP"),
-                            ("TOPPADDING",(0,0),(-1,-1),8),("BOTTOMPADDING",(0,0),(-1,-1),8)]))
-    story += [dt, Spacer(1, 18), Paragraph("<b>AVIS FAVORABLE DE L'ÉTABLISSEMENT D'ACCUEIL</b>", styles["Heading2"]),
-              Paragraph("Je soussigné(e), représentant(e) de l'établissement d'accueil, donne un avis favorable à l'accueil du/des étudiant(s) désigné(s) ci-dessus pour le stage indiqué.", styles["BodyText"]),
-              Spacer(1, 35), Paragraph("Nom, qualité et signature du responsable :", styles["BodyText"]),
-              Spacer(1, 32), Paragraph("Cachet de l'établissement :", styles["BodyText"]),
-              Spacer(1, 22), Paragraph("Après signature et cachet, le demandeur principal doit téléverser ce document sur la plateforme pour transmission au Chef de département.", styles["Small"])]
+    details_table = Table(
+        [[para(label, "LabelFGE"), para(value)] for label,value in details],
+        colWidths=[3.5*cm, usable_width-3.5*cm], hAlign="LEFT"
+    )
+    details_table.setStyle(table_style())
+    details_table.setStyle(TableStyle([
+        ("BACKGROUND",(0,0),(0,-1),colors.HexColor("#edf3f8"))
+    ]))
+    story += [
+        details_table, Spacer(1, 13),
+        para("AVIS FAVORABLE DE L'ÉTABLISSEMENT D'ACCUEIL", "SectionFGE"),
+        para("Je soussigné(e), représentant(e) de l'établissement d'accueil, donne un avis favorable à l'accueil du/des étudiant(s) désigné(s) ci-dessus pour le stage indiqué.", "SmallFGE"),
+        Spacer(1, 25),
+        para("Nom, qualité et signature du responsable :", "SmallFGE"),
+        Spacer(1, 25),
+        para("Cachet de l'établissement :", "SmallFGE"),
+        Spacer(1, 15),
+        para("Après signature et cachet, le demandeur principal doit téléverser ce document sur la plateforme pour transmission au Chef de département.", "SmallFGE")
+    ]
     doc.build(story)
     return buffer.getvalue()
 
