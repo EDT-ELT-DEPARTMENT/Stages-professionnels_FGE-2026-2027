@@ -79,10 +79,13 @@ def student_record(row):
     return {
         "matricule": first_value(row, "Mat. Etudiant"),
         "nom": first_value(row, "Nom"), "prenom": first_value(row, "Prénom"),
-        "nom_arabe": first_value(row, "اللقب"), "prenom_arabe": first_value(row, "الإسم"),
+        # Ces deux champs arabes sont lus explicitement depuis les colonnes du classeur source.
+        "nom_arabe": first_value(row, "اللقب"),
+        "prenom_arabe": first_value(row, "الإسم"),
         "date_naissance": first_value(row, "Date de naiss.", "Date de naissance"),
-        "lieu_naissance": first_value(row, "Lieu de naissance", "Ville de naissance"),
+        "lieu_naissance": first_value(row, "Lieu de naissance"),
         "wilaya_residence": first_value(row, "Wilaya de résidence"),
+        # Dans le fichier source, « Ville de naissance » contient le nom de la ville en arabe.
         "ville_naissance": first_value(row, "Ville de naissance"),
         "wilaya_naissance": first_value(row, "Wilaya de naissance", "Wilaya de naissance.1"),
         "promotion": first_value(row, "Promotion"), "groupe": first_value(row, "Groupe"),
@@ -159,21 +162,28 @@ def build_request_pdf(request_data, participants):
         def arabic_display(value):
             return str(value or "")
 
-    # Police Unicode si disponible (accents et caractères arabes).
-    arabic_font = "Helvetica"
-    for font_path in [
+    # Police Unicode embarquée dans le projet : indispensable pour les glyphes arabes.
+    # Le fichier DejaVuSans.ttf est livré avec le ZIP afin de ne pas dépendre des polices
+    # installées sur Streamlit Cloud.
+    arabic_font = None
+    font_candidates = [
         APP_DIR / "DejaVuSans.ttf",
         Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
         Path("/usr/share/fonts/truetype/dejavu/DejaVuSansCondensed.ttf"),
-    ]:
-        if font_path.exists():
+    ]
+    for font_path in font_candidates:
+        if font_path.is_file():
             try:
                 if "FGEArabic" not in pdfmetrics.getRegisteredFontNames():
                     pdfmetrics.registerFont(TTFont("FGEArabic", str(font_path)))
                 arabic_font = "FGEArabic"
                 break
             except Exception:
-                pass
+                continue
+    if arabic_font is None:
+        raise RuntimeError(
+            "Police arabe introuvable. Vérifiez que DejaVuSans.ttf est présent à côté de app.py."
+        )
 
     buffer = io.BytesIO()
     page_width, page_height = A4
@@ -296,7 +306,28 @@ def build_request_pdf(request_data, participants):
     supervisor_table.setStyle(TableStyle([
         ("BACKGROUND",(0,0),(0,-1),colors.HexColor("#edf3f8"))
     ]))
-    story += [supervisor_table, Spacer(1, 9), para("Entreprise d'accueil", "SectionFGE")]
+    supervisor_signature = Table(
+        [
+            [para("Signature de l'enseignant superviseur", "LabelFGE"), ""],
+            [para("Nom et prénom :", "LabelFGE"), para(request_data.get("superviseur", ""))],
+        ],
+        colWidths=[4.8*cm, usable_width-4.8*cm],
+        rowHeights=[2.0*cm, 0.65*cm],
+        hAlign="LEFT",
+    )
+    supervisor_signature.setStyle(TableStyle([
+        ("GRID", (0,0), (-1,-1), 0.45, colors.HexColor("#9aa9b5")),
+        ("BACKGROUND", (0,0), (0,-1), colors.HexColor("#edf3f8")),
+        ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
+        ("LEFTPADDING", (0,0), (-1,-1), 6),
+        ("RIGHTPADDING", (0,0), (-1,-1), 6),
+        ("TOPPADDING", (0,0), (-1,-1), 5),
+        ("BOTTOMPADDING", (0,0), (-1,-1), 5),
+    ]))
+    story += [
+        supervisor_table, Spacer(1, 5), supervisor_signature,
+        Spacer(1, 9), para("Entreprise d'accueil", "SectionFGE")
+    ]
 
     fields = [
         ["Entreprise", request_data.get("entreprise",""), "Secteur", request_data.get("secteur","")],
@@ -391,7 +422,7 @@ if page == "Demande de stage":
             st.write(f"**{main_student['nom']} {main_student['prenom']}** — {main_student['matricule']}")
             st.write(f"Nom et prénom en arabe : {main_student['nom_arabe']} {main_student['prenom_arabe']}")
             st.write(f"Promotion : {main_student['promotion']} | Groupe : {main_student['groupe']} | Sous-groupe : {main_student['sous_groupe']}")
-            st.write(f"Date de naissance : {main_student['date_naissance']} | Lieu de naissance : {main_student['lieu_naissance']}")
+            st.write(f"Date de naissance : {main_student['date_naissance']} | Lieu de naissance : {main_student['lieu_naissance']} | Ville de naissance : {main_student['ville_naissance']}")
             st.write(f"Wilaya de résidence : {main_student['wilaya_residence']} | Wilaya de naissance : {main_student['wilaya_naissance']}")
             st.write(f"Téléphone : {main_student['telephone']} | E-mail : {main_student['email']}")
 
