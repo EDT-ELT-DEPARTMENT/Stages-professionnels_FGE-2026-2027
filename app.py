@@ -5,6 +5,7 @@ from datetime import date, datetime
 import os, re, sqlite3, json, io
 import html
 import base64, zlib, tempfile
+from docx import Document
 import pandas as pd
 import streamlit as st
 from reportlab.lib import colors
@@ -50,6 +51,7 @@ if not TEACHERS_FILE.exists():
     if candidates:
         TEACHERS_FILE = candidates[0]
 DB_FILE = APP_DIR / "demandes_stages.db"
+CONVENTION_TEMPLATE = APP_DIR / "conventions.docx"
 SHEET_NAME = "Feuille1"
 DEPARTEMENTS_FGE = [
     "Département d’électrotechnique",
@@ -143,6 +145,62 @@ def load_permanent_teachers(path, modified_time):
     df = df[df["_label"] != ""].drop_duplicates("_label")
     return sorted(df["_label"].tolist(), key=lambda x: x.casefold())
 
+
+def _replace_docx_paragraph(paragraph, replacements):
+    original = paragraph.text
+    updated = original
+    for old, new in replacements.items():
+        if old in updated:
+            updated = updated.replace(old, str(new or ""))
+    if updated != original:
+        # Le modèle contient des champs répartis sur plusieurs runs ; réécrire le
+        # paragraphe évite de laisser des morceaux de l'exemple dans le document.
+        paragraph.text = updated
+
+def build_three_stage_documents(request_data, participants):
+    """Remplit le modèle institutionnel fourni (assiduité + convention + attestation)."""
+    if not CONVENTION_TEMPLATE.is_file():
+        raise FileNotFoundError("Le modèle conventions.docx est absent du dépôt GitHub.")
+    doc = Document(str(CONVENTION_TEMPLATE))
+    r = request_data
+    full_name = f'{r.get("nom","")} {r.get("prenom","")}'.strip()
+    company = r.get("entreprise", "")
+    address = r.get("adresse_entreprise", "")
+    wilaya = r.get("wilaya_entreprise", "")
+    start, end = r.get("date_debut",""), r.get("date_fin","")
+    period = f"du {start} au {end}".strip()
+    replacements = {
+        "ablasaoudi99@gmail.com": r.get("email",""), "666187646": r.get("telephone",""),
+        "Nom : saoudi": f'Nom : {r.get("nom","")}',
+        "Nom\xa0: saoudi": f'Nom : {r.get("nom","")}',
+        "Prénom : abla": f'Prénom : {r.get("prenom","")}',
+        "Hassi Messaoud-Ouargla": r.get("wilaya_residence",""),
+        "2025-2026": "2026-2027",
+        "2 éme année Licence": r.get("promotion",""),
+        "Electrotechnique": "Electrotechnique",
+        "MCIL Electrotechnique": r.get("promotion",""),
+        "22/03/2026": start, "04/04/2026": end,
+        "Sonatrach/division Production-Direction Régionale Ouagla-hassi Messaoud": company,
+        "Sonatrach/division Production-Direction Régionale": company,
+        "EL BGUEL.BP 113": address, "HASSI MESSAOUD /OUARGLA": wilaya,
+        "saoudi abla": full_name,
+        "09/09/2005": r.get("date_naissance",""),
+        "Mchedallah /Bouira": r.get("lieu_naissance",""),
+        "sontrach/division Production-Direction Régionale": company,
+        "(nombres d’étudiants)": str(1 + len(participants)),
+    }
+    def walk_paragraphs(container):
+        for paragraph in getattr(container, "paragraphs", []):
+            _replace_docx_paragraph(paragraph, replacements)
+        for table in getattr(container, "tables", []):
+            for row in table.rows:
+                for cell in row.cells:
+                    walk_paragraphs(cell)
+    walk_paragraphs(doc)
+    out = io.BytesIO()
+    doc.save(out)
+    return out.getvalue()
+
 def init_db():
     with sqlite3.connect(DB_FILE) as con:
         con.execute("""
@@ -168,6 +226,8 @@ def init_db():
             "participants_json": "TEXT DEFAULT '[]'",
             "statut": "TEXT DEFAULT 'Brouillon - formulaire à signer'",
             "signed_pdf": "BLOB",
+            "documents_docx": "BLOB", "documents_date": "TEXT", "vice_dean_avis": "TEXT",
+            "vice_dean_date": "TEXT", "vice_dean_comment": "TEXT",
             "wilaya_residence": "TEXT", "ville_naissance": "TEXT", "wilaya_naissance": "TEXT",
             "date_naissance": "TEXT", "lieu_naissance": "TEXT",
             "enseignant_superviseur": "TEXT", "programme_stage": "TEXT",
@@ -451,7 +511,7 @@ if not permanent_teachers:
 
 with st.sidebar:
     st.header("Navigation")
-    page = st.radio("Rubrique", ["Demande de stage", "Administration"])
+    page = st.radio("Rubrique", ["Demande de stage", "Chef de département", "Vice-doyen", "Administration"])
     st.divider()
     st.caption("FGE • 2026-2027")
 
@@ -729,7 +789,7 @@ if page == "Demande de stage":
                     con.commit()
                 st.success(f"Votre demande de visite a été enregistrée. Référence : VIS-{visit_id:05d}.")
 
-else:
+elif page == "Administration":
     st.title("Administration — Suivi des demandes")
     pwd = st.text_input("Mot de passe administrateur", type="password")
     expected = admin_password()
@@ -791,6 +851,99 @@ else:
             elif row:
                 st.warning(f"Statut : {row[1]} — le document signé n'a pas encore été déposé.")
     elif pwd: st.error("Mot de passe incorrect.")
+
+
+elif page == "Chef de département":
+    st.title("Espace du Chef de département")
+    pwd_chef = st.text_input("Mot de passe Chef de département", type="password", key="pwd_chef")
+    try:
+        expected_chef = st.secrets.get("CHEF_DEPT_PASSWORD", admin_password())
+    except Exception:
+        expected_chef = os.getenv("CHEF_DEPT_PASSWORD", admin_password())
+    if pwd_chef and pwd_chef == expected_chef:
+        with sqlite3.connect(DB_FILE) as con:
+            chef_data = pd.read_sql_query("SELECT id, date_soumission, matricule, nom, prenom, entreprise, sujet_stage, statut, signed_pdf, documents_docx FROM demandes WHERE type_demande='Stage rémunéré' ORDER BY id DESC", con)
+        if chef_data.empty:
+            st.info("Aucune demande de stage.")
+        else:
+            ids = chef_data["id"].tolist()
+            selected_chef = st.selectbox("Demande à traiter", ids, format_func=lambda x: f"STG-{x:05d} — " + str(chef_data.loc[chef_data.id==x, "nom"].iloc[0]) + " " + str(chef_data.loc[chef_data.id==x, "prenom"].iloc[0]))
+            with sqlite3.connect(DB_FILE) as con:
+                con.row_factory = sqlite3.Row
+                rec = con.execute("SELECT * FROM demandes WHERE id=?", (selected_chef,)).fetchone()
+            rec = dict(rec) if rec else {}
+            if rec.get("signed_pdf"):
+                st.download_button("Télécharger la demande signée par l'étudiant", bytes(rec["signed_pdf"]),
+                                   f"Demande_signee_STG-{selected_chef:05d}.pdf", "application/pdf")
+                st.markdown("### Génération des trois documents institutionnels")
+                st.caption("Le modèle conventions.docx fourni est rempli à partir des informations enregistrées dans la demande de l'étudiant.")
+                if st.button("Générer Attestation d’Assiduité, Convention de Stage et Attestation de Stage", type="primary"):
+                    try:
+                        plist = json.loads(rec.get("participants_json") or "[]")
+                        payload = build_three_stage_documents(rec, plist)
+                        with sqlite3.connect(DB_FILE) as con:
+                            con.execute("""UPDATE demandes SET documents_docx=?, documents_date=?, statut=? WHERE id=?""",
+                                (sqlite3.Binary(payload), datetime.now().isoformat(timespec="minutes"),
+                                 "Documents générés - En attente de l'avis du Vice-doyen", selected_chef))
+                            con.commit()
+                        st.success("Les trois formulaires ont été remplis. Le dossier est transmis à l'espace du Vice-doyen pour avis.")
+                        st.download_button("Télécharger les trois documents remplis (DOCX)", payload,
+                            f"Documents_stage_STG-{selected_chef:05d}.docx",
+                            "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+                    except Exception as exc:
+                        st.error(f"Impossible de générer les documents : {exc}")
+                if rec.get("documents_docx"):
+                    st.download_button("Télécharger les documents déjà générés", bytes(rec["documents_docx"]),
+                        f"Documents_stage_STG-{selected_chef:05d}.docx",
+                        "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+                if rec.get("vice_dean_avis") == "Avis favorable":
+                    st.success("Avis favorable du Vice-doyen reçu. Le dossier est retourné au Chef de département.")
+                    st.info(rec.get("vice_dean_comment") or "Aucune observation.")
+            else:
+                st.warning("Le formulaire signé par l'étudiant n'est pas encore disponible.")
+    elif pwd_chef:
+        st.error("Mot de passe incorrect.")
+
+elif page == "Vice-doyen":
+    st.title("Espace du Vice-doyen")
+    pwd_vd = st.text_input("Mot de passe Vice-doyen", type="password", key="pwd_vd")
+    try:
+        expected_vd = st.secrets.get("VICE_DEAN_PASSWORD", os.getenv("VICE_DEAN_PASSWORD", ""))
+    except Exception:
+        expected_vd = os.getenv("VICE_DEAN_PASSWORD", "")
+    if not expected_vd:
+        st.warning("Configurez VICE_DEAN_PASSWORD dans les secrets Streamlit pour activer cet espace.")
+    elif pwd_vd and pwd_vd == expected_vd:
+        with sqlite3.connect(DB_FILE) as con:
+            vd_data = pd.read_sql_query("""SELECT id, matricule, nom, prenom, entreprise, statut, documents_date,
+                documents_docx, vice_dean_avis, vice_dean_comment FROM demandes
+                WHERE documents_docx IS NOT NULL ORDER BY id DESC""", con)
+        if vd_data.empty:
+            st.info("Aucun dossier n'attend un avis du Vice-doyen.")
+        else:
+            pending_vd = vd_data[vd_data["vice_dean_avis"].isna() | (vd_data["vice_dean_avis"] == "")]
+            st.metric("Dossiers en attente d'avis", len(pending_vd))
+            selected_vd = st.selectbox("Dossier à examiner", vd_data["id"].tolist(),
+                format_func=lambda x: f"STG-{x:05d} — " + str(vd_data.loc[vd_data.id==x, "nom"].iloc[0]) + " " + str(vd_data.loc[vd_data.id==x, "prenom"].iloc[0]))
+            with sqlite3.connect(DB_FILE) as con:
+                row_vd = con.execute("SELECT documents_docx, vice_dean_avis, vice_dean_comment FROM demandes WHERE id=?", (selected_vd,)).fetchone()
+            if row_vd and row_vd[0]:
+                st.download_button("Consulter / télécharger les trois documents", bytes(row_vd[0]),
+                    f"Documents_stage_STG-{selected_vd:05d}.docx",
+                    "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+                current_avis = row_vd[1] or ""
+                st.write("Avis actuel :", current_avis or "En attente")
+                comment_vd = st.text_area("Observation du Vice-doyen", value=row_vd[2] or "", key=f"vd_comment_{selected_vd}")
+                if st.button("Accorder un avis favorable et transmettre au Chef de département", type="primary"):
+                    with sqlite3.connect(DB_FILE) as con:
+                        con.execute("""UPDATE demandes SET vice_dean_avis=?, vice_dean_date=?, vice_dean_comment=?,
+                            statut=? WHERE id=?""",
+                            ("Avis favorable", datetime.now().isoformat(timespec="minutes"), comment_vd,
+                             "Avis favorable du Vice-doyen - Retour au Chef de département", selected_vd))
+                        con.commit()
+                    st.success(f"Avis favorable enregistré pour STG-{selected_vd:05d}. Le dossier est maintenant visible par le Chef de département.")
+    elif pwd_vd:
+        st.error("Mot de passe incorrect.")
 
 st.divider()
 st.caption("Faculté de Génie Électrique — Plateforme de stages professionnels 2026-2027")
