@@ -194,8 +194,8 @@ def build_request_pdf(request_data, participants):
         ("TOPPADDING",(0,0),(-1,-1),5),("BOTTOMPADDING",(0,0),(-1,-1),5)
     ]))
     story += [t, Spacer(1, 12), Paragraph("<b>Encadrement du stage</b>", styles["Heading2"])]
-    supervisor_rows = [["Enseignant superviseur (Permanent)", request_data["superviseur"]],
-                       ["Programme détaillé du stage", request_data["programme"]]]
+    supervisor_rows = [["Enseignant superviseur (Permanent)", request_data.get("superviseur", "Non renseigné")],
+                       ["Programme détaillé du stage", request_data.get("programme", "Non renseigné")]]
     stbl = Table(supervisor_rows, colWidths=[4.5*cm, 11.0*cm])
     stbl.setStyle(TableStyle([("GRID",(0,0),(-1,-1),0.4,colors.grey),
         ("BACKGROUND",(0,0),(0,-1),colors.HexColor("#edf3f8")),
@@ -355,7 +355,11 @@ if page == "Demande de stage":
                 req = {"entreprise":entreprise.strip(),"secteur":secteur.strip(),"adresse":adresse.strip(),
                        "wilaya":wilaya.strip(),"tel_ent":tel_ent.strip(),"email_ent":email_ent.strip(),
                        "responsable":responsable.strip(),"fonction":fonction.strip(),"sujet":sujet.strip(),
-                       "domaine":domaine.strip(),"debut":debut.isoformat(),"fin":fin.isoformat(),
+                       "domaine":domaine.strip(),
+                       # Ces deux champs sont obligatoires dans le PDF et en base.
+                       "superviseur":superviseur.strip(),
+                       "programme":programme.strip(),
+                       "debut":debut.isoformat(),"fin":fin.isoformat(),
                        "observations":observations.strip()}
                 pdf = build_request_pdf(req, participants)
                 with sqlite3.connect(DB_FILE) as con:
