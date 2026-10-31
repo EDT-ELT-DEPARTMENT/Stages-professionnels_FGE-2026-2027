@@ -216,36 +216,40 @@ def remplir_tableau_assiduite(doc, date_debut, date_fin):
             table.cell(idx,2).text = ""
         current += timedelta(days=1)
 
-def build_three_stage_documents(request_data, participants):
-    """Remplit le modèle institutionnel fourni (assiduité + convention + attestation)."""
+def build_three_stage_documents(request_data, student, nb_participants=1):
+    """Remplit le modèle institutionnel (assiduité + convention + attestation) pour UN SEUL étudiant.
+
+    Toutes les informations personnelles (nom, prénom, matricule, naissance, adresse, e-mail,
+    téléphone, promotion) proviennent de l'étudiant concerné, jamais du demandeur principal.
+    """
     if not CONVENTION_TEMPLATE.is_file():
         raise FileNotFoundError("Le modèle conventions.docx est absent du dépôt GitHub.")
     doc = Document(str(CONVENTION_TEMPLATE))
-    remplir_tableau_assiduite(doc, request_data.get("date_debut", ""), request_data.get("date_fin", ""))
     r = request_data
-    primary_student = participants[0] if participants else {}
-    full_name = f'{r.get("nom","")} {r.get("prenom","")}'.strip()
+    s = student or {}
+    remplir_tableau_assiduite(doc, r.get("date_debut", ""), r.get("date_fin", ""))
+    nom, prenom = s.get("nom", "") or "", s.get("prenom", "") or ""
+    full_name = f"{nom} {prenom}".strip()
     company = r.get("entreprise", "")
     address = r.get("adresse_entreprise", "")
     wilaya = r.get("wilaya_entreprise", "")
-    start, end = r.get("date_debut",""), r.get("date_fin","")
-    period = f"du {start} au {end}".strip()
-    # L'adresse et le matricule sont pris dans les données corrigées de l'étudiant.
-    domicile = (primary_student.get("adresse_domicile") or r.get("adresse_domicile") or "")
-    matricule = (primary_student.get("matricule") or r.get("matricule") or "")
+    start, end = r.get("date_debut", ""), r.get("date_fin", "")
+    domicile = s.get("adresse_domicile") or ""
+    matricule = s.get("matricule") or ""
+    promotion = s.get("promotion") or r.get("promotion", "")
     replacements = {
-        "ablasaoudi99@gmail.com": primary_student.get("email") or r.get("email", ""),
-        "666187646": primary_student.get("telephone") or r.get("telephone", ""),
-        "Nom : saoudi": f'Nom : {r.get("nom","")}',
-        "Nom\xa0: saoudi": f'Nom : {r.get("nom","")}',
-        "Prénom : abla": f'Prénom : {r.get("prenom","")}',
+        "ablasaoudi99@gmail.com": s.get("email", ""),
+        "666187646": s.get("telephone", ""),
+        "Nom : saoudi": f"Nom : {nom}",
+        "Nom\xa0: saoudi": f"Nom : {nom}",
+        "Prénom : abla": f"Prénom : {prenom}",
         # Ne jamais remplacer l'adresse du domicile par la wilaya de résidence.
         "Adresse : Hassi Messaoud-Ouargla": f"Adresse : {domicile}",
-        "Adresse : Hassi Messaoud-Ouargla": f"Adresse : {domicile}",
+        "Adresse\xa0: Hassi Messaoud-Ouargla": f"Adresse : {domicile}",
         "2025-2026": "2026-2027",
-        "2 éme année Licence": r.get("promotion",""),
+        "2 éme année Licence": promotion,
         "Electrotechnique": "Electrotechnique",
-        "MCIL Electrotechnique": r.get("promotion",""),
+        "MCIL Electrotechnique": promotion,
         # Date de signature de la convention : date réelle de génération du document.
         "22-04-2026": datetime.now().strftime("%d-%m-%Y"),
         "22/03/2026": start, "04/04/2026": end,
@@ -253,17 +257,14 @@ def build_three_stage_documents(request_data, participants):
         "Sonatrach/division Production-Direction Régionale": company,
         "EL BGUEL.BP 113": address, "HASSI MESSAOUD /OUARGLA": wilaya,
         "saoudi abla": full_name,
-        # Le remplacement global de l'année transforme d'abord 2025-2026 en
-        # 2026-2027 : on cible donc explicitement la version finale du libellé.
         "Inscrit (e) sous le Numéro.   …………………   .pour l’année universitaire 2026-2027:":
             f"Inscrit (e) sous le Numéro.   {matricule}   .pour l’année universitaire 2026-2027:",
-        # Compatibilité avec un modèle qui conserverait encore l'année 2025-2026.
         "Inscrit (e) sous le Numéro.   …………………   .pour l’année universitaire 2025-2026:":
             f"Inscrit (e) sous le Numéro.   {matricule}   .pour l’année universitaire 2026-2027:",
-        "09/09/2005": r.get("date_naissance", primary_student.get("date_naissance", "")),
-        "Mchedallah /Bouira": r.get("lieu_naissance",""),
+        "09/09/2005": s.get("date_naissance", ""),
+        "Mchedallah /Bouira": s.get("lieu_naissance", ""),
         "sontrach/division Production-Direction Régionale": company,
-        "(nombres d’étudiants)": str(1 + len(participants)),
+        "(nombres d’étudiants)": str(max(1, int(nb_participants or 1))),
     }
     def walk_paragraphs(container):
         for paragraph in getattr(container, "paragraphs", []):
@@ -320,7 +321,124 @@ def init_db():
             autorise_le TEXT NOT NULL,
             motif TEXT DEFAULT ''
         )""")
+        # Dossier INDIVIDUEL de chaque étudiant d'une demande : CCP, chèque barré, documents et avis propres.
+        con.execute("""CREATE TABLE IF NOT EXISTS dossiers_etudiants (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            demande_id INTEGER NOT NULL,
+            matricule_key TEXT NOT NULL,
+            matricule TEXT, nom TEXT, prenom TEXT, promotion TEXT,
+            ccp_number TEXT, cheque_barre BLOB,
+            documents_docx BLOB, documents_date TEXT,
+            vice_dean_avis TEXT, vice_dean_date TEXT, vice_dean_comment TEXT,
+            UNIQUE(demande_id, matricule_key)
+        )""")
+        ensure_all_dossiers(con)
         con.commit()
+
+# Rend le CCP et le chèque barré obligatoires pour chaque étudiant (mettre False pour les rendre facultatifs).
+CCP_CHEQUE_OBLIGATOIRES = True
+
+def _participants_of_request(con, rid):
+    """Liste des étudiants d'une demande (demandeur principal en premier)."""
+    row = con.execute("SELECT matricule, nom, prenom, promotion, participants_json FROM demandes WHERE id=?", (rid,)).fetchone()
+    if not row:
+        return []
+    try:
+        plist = json.loads(row[4] or "[]")
+    except (TypeError, ValueError):
+        plist = []
+    if not isinstance(plist, list):
+        plist = []
+    plist = [p for p in plist if isinstance(p, dict) and normalize_matricule(p.get("matricule", ""))]
+    main_key = normalize_matricule(row[0])
+    if main_key and main_key not in {normalize_matricule(p["matricule"]) for p in plist}:
+        plist.insert(0, {"matricule": row[0], "nom": row[1], "prenom": row[2], "promotion": row[3]})
+    return plist
+
+def ensure_dossiers(con, rid):
+    """Crée les dossiers individuels manquants d'une demande.
+
+    Migration des anciennes demandes : lorsqu'une demande n'a encore aucun dossier individuel, le CCP et le chèque
+    de l'ancien format sont attribués au demandeur principal, et les documents/avis déjà enregistrés sont conservés
+    pour chaque étudiant (les anciens avis favorables continuent donc de bloquer les mêmes étudiants).
+    """
+    existing = con.execute("SELECT COUNT(*) FROM dossiers_etudiants WHERE demande_id=?", (rid,)).fetchone()[0]
+    legacy = None
+    if existing == 0:
+        legacy = con.execute("""SELECT ccp_number, cheque_barre, documents_docx, documents_date, vice_dean_avis,
+            vice_dean_date, vice_dean_comment, matricule FROM demandes WHERE id=?""", (rid,)).fetchone()
+    for p in _participants_of_request(con, rid):
+        key = normalize_matricule(p.get("matricule", ""))
+        ccp, cheque, docs, docs_date, avis, avis_date, avis_comment = (p.get("ccp_number") or ""), None, None, None, None, None, None
+        if legacy:
+            if key == normalize_matricule(legacy[7]):
+                ccp = ccp or (legacy[0] or "")
+                cheque = legacy[1]
+            docs, docs_date, avis, avis_date, avis_comment = legacy[2], legacy[3], legacy[4], legacy[5], legacy[6]
+        con.execute("""INSERT OR IGNORE INTO dossiers_etudiants
+            (demande_id, matricule_key, matricule, nom, prenom, promotion, ccp_number, cheque_barre,
+             documents_docx, documents_date, vice_dean_avis, vice_dean_date, vice_dean_comment)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (rid, key, p.get("matricule", ""), p.get("nom", ""), p.get("prenom", ""), p.get("promotion", ""),
+             ccp, cheque, docs, docs_date, avis, avis_date, avis_comment))
+
+def ensure_all_dossiers(con):
+    ids = [r[0] for r in con.execute("""SELECT id FROM demandes
+        WHERE COALESCE(type_demande, 'Stage rémunéré') = 'Stage rémunéré'
+          AND id NOT IN (SELECT DISTINCT demande_id FROM dossiers_etudiants)""")]
+    for rid in ids:
+        ensure_dossiers(con, rid)
+
+def save_dossiers(con, rid, participants, cheques):
+    """Enregistre le CCP et le chèque barré PROPRES à chaque étudiant (cheques = {matricule_key: bytes})."""
+    keys = []
+    for p in participants:
+        key = normalize_matricule(p.get("matricule", ""))
+        if not key:
+            continue
+        keys.append(key)
+        cheque = cheques.get(key)
+        con.execute("""INSERT INTO dossiers_etudiants
+            (demande_id, matricule_key, matricule, nom, prenom, promotion, ccp_number, cheque_barre)
+            VALUES (?,?,?,?,?,?,?,?)
+            ON CONFLICT(demande_id, matricule_key) DO UPDATE SET
+              matricule=excluded.matricule, nom=excluded.nom, prenom=excluded.prenom, promotion=excluded.promotion,
+              ccp_number=excluded.ccp_number, cheque_barre=COALESCE(excluded.cheque_barre, dossiers_etudiants.cheque_barre)""",
+            (rid, key, p.get("matricule", ""), p.get("nom", ""), p.get("prenom", ""), p.get("promotion", ""),
+             str(p.get("ccp_number") or "").strip(), sqlite3.Binary(cheque) if cheque else None))
+    if keys:
+        marks = ",".join("?" * len(keys))
+        con.execute(f"DELETE FROM dossiers_etudiants WHERE demande_id=? AND matricule_key NOT IN ({marks})", (rid, *keys))
+
+def favorable_dossiers_for(con, matricule_key):
+    """Avis favorables reçus PERSONNELLEMENT par un étudiant (un co-stagiaire n'est pas concerné)."""
+    cur = con.execute("""SELECT r.id AS id, d.matricule AS matricule, d.nom AS nom, d.prenom AS prenom,
+            COALESCE(NULLIF(d.promotion, ''), r.promotion) AS promotion, r.entreprise AS entreprise,
+            r.sujet_stage AS sujet_stage, d.vice_dean_avis AS vice_dean_avis, d.vice_dean_date AS vice_dean_date,
+            d.vice_dean_comment AS vice_dean_comment, r.statut AS statut
+        FROM dossiers_etudiants d JOIN demandes r ON r.id = d.demande_id
+        WHERE d.matricule_key = ? AND TRIM(COALESCE(d.vice_dean_avis, '')) = 'Avis favorable'
+          AND COALESCE(r.type_demande, 'Stage rémunéré') = 'Stage rémunéré'
+        ORDER BY d.id DESC""", (matricule_key,))
+    cols = [c[0] for c in cur.description]
+    return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+def refresh_request_status(con, rid):
+    """Met à jour le statut global de la demande à partir de l'état de chaque dossier individuel."""
+    rows = con.execute("""SELECT documents_docx IS NOT NULL, TRIM(COALESCE(vice_dean_avis, '')) = 'Avis favorable'
+        FROM dossiers_etudiants WHERE demande_id=?""", (rid,)).fetchall()
+    if not rows:
+        return
+    total, n_docs, n_fav = len(rows), sum(1 for r in rows if r[0]), sum(1 for r in rows if r[1])
+    if n_fav == total:
+        con.execute("UPDATE demandes SET statut=?, vice_dean_avis='Avis favorable' WHERE id=?",
+                    ("Avis favorable du Vice-doyen - Retour au Chef de département", rid))
+    elif n_fav > 0:
+        con.execute("UPDATE demandes SET statut=?, vice_dean_avis=NULL WHERE id=?",
+                    (f"Avis favorable pour {n_fav}/{total} étudiant(s) - En attente du Vice-doyen", rid))
+    elif n_docs > 0:
+        con.execute("UPDATE demandes SET statut=?, vice_dean_avis=NULL WHERE id=?",
+                    ("Documents générés - En attente de l'avis du Vice-doyen", rid))
 
 def admin_password():
     try: return st.secrets.get("ADMIN_PASSWORD", os.getenv("ADMIN_PASSWORD", ""))
@@ -483,7 +601,7 @@ def build_request_pdf(request_data, participants):
             [para("Adresse du domicile", "LabelFGE"), para(get("adresse_domicile")),
              para("Téléphone", "LabelFGE"), para(phone)],
             [para("E-mail", "LabelFGE"), para(email_value),
-             para("N° CCP", "LabelFGE"), para(request_data.get("ccp_number", ""))],
+             para("N° CCP", "LabelFGE"), para(get("ccp_number"))],
         ])
     student_table = LongTable(rows, colWidths=student_widths, repeatRows=0, hAlign="LEFT")
     student_table.setStyle(table_style())
@@ -626,49 +744,22 @@ if page == "Demande de stage":
         else:
             main_student = student_record(found.iloc[0])
 
-            # Vérification automatique des avis favorables déjà accordés.
-            # Le contrôle couvre le demandeur principal ainsi que les participants
-            # enregistrés dans les demandes groupées.
+            # Blocage INDIVIDUEL : seul l'étudiant ayant lui-même reçu un avis favorable est bloqué.
+            # Le co-stagiaire d'un binôme n'est pas concerné tant que son propre dossier n'a pas d'avis favorable.
             matricule_key = normalize_matricule(main_student["matricule"])
-            favorable_previous_requests = []
             with sqlite3.connect(DB_FILE) as con:
-                con.row_factory = sqlite3.Row
                 reapply_authorized = con.execute(
                     "SELECT 1 FROM autorisations_nouveau_stage WHERE matricule_key=?",
                     (matricule_key,)
                 ).fetchone() is not None
-                favorable_rows = con.execute("""
-                    SELECT id, matricule, nom, prenom, promotion, entreprise,
-                           sujet_stage, vice_dean_avis, vice_dean_date,
-                           vice_dean_comment, statut, participants_json
-                    FROM demandes
-                    WHERE TRIM(COALESCE(vice_dean_avis, '')) = 'Avis favorable'
-                      AND COALESCE(type_demande, 'Stage rémunéré') = 'Stage rémunéré'
-                    ORDER BY id DESC
-                """).fetchall()
+                favorable_previous_requests = favorable_dossiers_for(con, matricule_key)
+                # Demande en cours (document signé pas encore déposé) : l'étudiant doit pouvoir la terminer.
+                open_pending = con.execute(
+                    "SELECT 1 FROM demandes WHERE matricule=? AND COALESCE(type_demande,'Stage rémunéré')='Stage rémunéré' "
+                    "AND signed_pdf IS NULL LIMIT 1", (matricule_key,)
+                ).fetchone() is not None
 
-            for previous_row in favorable_rows:
-                previous = dict(previous_row)
-                found_in_previous = (
-                    normalize_matricule(previous.get("matricule", "")) == matricule_key
-                )
-                if not found_in_previous:
-                    try:
-                        previous_participants = json.loads(
-                            previous.get("participants_json") or "[]"
-                        )
-                    except (TypeError, ValueError, json.JSONDecodeError):
-                        previous_participants = []
-                    if isinstance(previous_participants, list):
-                        found_in_previous = any(
-                            isinstance(participant, dict)
-                            and normalize_matricule(participant.get("matricule", "")) == matricule_key
-                            for participant in previous_participants
-                        )
-                if found_in_previous:
-                    favorable_previous_requests.append(previous)
-
-            if favorable_previous_requests and not reapply_authorized:
+            if favorable_previous_requests and not reapply_authorized and not open_pending:
                 previous = favorable_previous_requests[0]
                 st.error(
                     "⛔ Un avis favorable a déjà été accordé pour ce matricule. "
@@ -716,6 +807,14 @@ if page == "Demande de stage":
             if row_pending:
                 cols_pending = [d[1] for d in con.execute("PRAGMA table_info(demandes)")]
                 pending_request = dict(zip(cols_pending, row_pending))
+        saved_dossiers = {}
+        if pending_request:
+            with sqlite3.connect(DB_FILE) as con:
+                ensure_dossiers(con, pending_request["id"])
+                con.commit()
+                for r_sd in con.execute("SELECT matricule_key, ccp_number, cheque_barre IS NOT NULL FROM dossiers_etudiants WHERE demande_id=?",
+                                        (pending_request["id"],)):
+                    saved_dossiers[r_sd[0]] = {"ccp_number": r_sd[1] or "", "has_cheque": bool(r_sd[2])}
         if pending_request:
             st.info(f"Une demande existe déjà pour votre matricule (référence STG-{pending_request['id']:05d}). "
                     "Son document signé n'a pas encore été déposé. Vos informations sont reprises ci-dessous : vous pouvez les modifier et régénérer le formulaire.")
@@ -764,6 +863,13 @@ if page == "Demande de stage":
                 record.update({k: v for k, v in saved_record.items() if k in record})
             if norm_promo(record["promotion"]) not in PROMOTIONS_STAGE_REMUNERE:
                 companion_errors.append(f"{record['nom']} {record['prenom']} ({record['promotion']}) n'est pas éligible au stage rémunéré.")
+                continue
+            with sqlite3.connect(DB_FILE) as con_c:
+                fav_c = favorable_dossiers_for(con_c, mk)
+                auth_c = con_c.execute("SELECT 1 FROM autorisations_nouveau_stage WHERE matricule_key=?", (mk,)).fetchone()
+            if fav_c and not auth_c and mk not in pending_by_matricule:
+                companion_errors.append(f"{record['nom']} {record['prenom']} ({mk}) a déjà obtenu un avis favorable : "
+                                        "il/elle ne peut pas être ajouté(e) à une nouvelle demande.")
                 continue
             participants.append(record)
 
@@ -831,10 +937,21 @@ if page == "Demande de stage":
             debut = d1.date_input("Date prévue de début", value=default_debut)
             fin = d2.date_input("Date prévue de fin", value=default_fin)
             observations = st.text_area("Observations", value=(pending_request or {}).get("observations", ""))
-            st.markdown("**Coordonnées CCP et chèque barré**")
-            ccp_col, cheque_col = st.columns([1, 1])
-            ccp_number = ccp_col.text_input("Numéro CCP de l’étudiant", value=str((pending_request or {}).get("ccp_number") or ""), placeholder="Numéro CCP")
-            cheque_file = cheque_col.file_uploader("Téléverser le chèque barré (image ou PDF)", type=["pdf", "png", "jpg", "jpeg"], key="cheque_barre_upload")
+            st.markdown("**Coordonnées CCP et chèque barré — individuels pour chaque étudiant**")
+            st.caption("Chaque étudiant (y compris en binôme) saisit son propre numéro CCP et téléverse son propre chèque barré.")
+            ccp_inputs, cheque_inputs = {}, {}
+            for p_form in participants:
+                pk_form = normalize_matricule(p_form.get("matricule", ""))
+                saved_form = saved_dossiers.get(pk_form, {})
+                with st.container(border=True):
+                    st.markdown(f"**{p_form.get('nom', '')} {p_form.get('prenom', '')}** — {p_form.get('matricule', '')}")
+                    cc1, cc2 = st.columns(2)
+                    ccp_inputs[pk_form] = cc1.text_input("Numéro CCP", value=str(saved_form.get("ccp_number") or ""),
+                                                         placeholder="Numéro CCP", key=f"ccp_{pk_form}")
+                    cheque_inputs[pk_form] = cc2.file_uploader("Chèque barré (image ou PDF)", type=["pdf", "png", "jpg", "jpeg"],
+                                                               key=f"cheque_{pk_form}")
+                    if saved_form.get("has_cheque"):
+                        cc2.caption("✅ Un chèque barré est déjà enregistré pour cet étudiant (téléversez un fichier uniquement pour le remplacer).")
             create = st.form_submit_button("📄 Générer le formulaire à faire signer", use_container_width=True)
 
         if create:
@@ -847,9 +964,31 @@ if page == "Demande de stage":
             if not superviseur.strip(): errors.append("Veuillez choisir un enseignant superviseur permanent.")
             if superviseur not in permanent_teachers: errors.append("L'enseignant choisi doit être un Permanent.")
             if fin < debut: errors.append("La date de fin doit être postérieure ou égale à la date de début.")
+            for p_chk in participants:
+                pk_chk = normalize_matricule(p_chk.get("matricule", ""))
+                who = f"{p_chk.get('nom', '')} {p_chk.get('prenom', '')} ({p_chk.get('matricule', '')})"
+                up_chk = cheque_inputs.get(pk_chk)
+                if CCP_CHEQUE_OBLIGATOIRES:
+                    if not str(ccp_inputs.get(pk_chk, "") or "").strip():
+                        errors.append(f"Le numéro CCP de {who} est obligatoire.")
+                    if up_chk is None and not saved_dossiers.get(pk_chk, {}).get("has_cheque"):
+                        errors.append(f"Le chèque barré de {who} est obligatoire.")
+                if up_chk is not None and up_chk.size > 10 * 1024 * 1024:
+                    errors.append(f"Le chèque barré de {who} dépasse la limite de 10 Mo.")
             if errors:
                 for e in errors: st.error(e)
             else:
+                ccp_by_key, cheque_by_key = {}, {}
+                for p_ in participants:
+                    pk_ = normalize_matricule(p_.get("matricule", ""))
+                    ccp_by_key[pk_] = str(ccp_inputs.get(pk_, "") or "").strip()
+                    p_["ccp_number"] = ccp_by_key[pk_]  # CCP propre à chaque étudiant (affiché dans le PDF)
+                    up_ = cheque_inputs.get(pk_)
+                    if up_ is not None:
+                        cheque_by_key[pk_] = up_.getvalue()
+                main_key_ = normalize_matricule(main_student["matricule"])
+                main_ccp = ccp_by_key.get(main_key_, "")  # colonnes historiques de `demandes` = demandeur principal
+                main_cheque = sqlite3.Binary(cheque_by_key[main_key_]) if cheque_by_key.get(main_key_) else None
                 req = {"departement": DEPARTEMENT_ACTUEL,
                        "entreprise":entreprise.strip(),"secteur":secteur.strip(),"adresse":adresse.strip(),
                        "wilaya":wilaya.strip(),"tel_ent":tel_ent.strip(),"email_ent":email_ent.strip(),
@@ -860,7 +999,7 @@ if page == "Demande de stage":
                        "programme":programme.strip(),
                        "debut":debut.isoformat(),"fin":fin.isoformat(),
                        "observations":observations.strip(),
-                       "ccp_number":str(ccp_number or "").strip(),
+                       "ccp_number":main_ccp,
                        "adresse_domicile":main_student.get("adresse_domicile", "")}
                 pdf = build_request_pdf(req, participants)
                 with sqlite3.connect(DB_FILE) as con:
@@ -881,7 +1020,7 @@ if page == "Demande de stage":
                             enseignant_superviseur=?,programme_stage=?,date_debut=?,date_fin=?,observations=?,wilaya_residence=?,
                             ville_naissance=?,wilaya_naissance=?,date_naissance=?,lieu_naissance=?,participants_json=?,date_soumission=?,
                             ccp_number=?,cheque_barre=COALESCE(?,cheque_barre),adresse_domicile=?,
-                            statut='En attente du document signé' WHERE id=?""", values + (str(ccp_number or "").strip(), sqlite3.Binary(cheque_file.getvalue()) if cheque_file else None, main_student.get("adresse_domicile", ""), rid))
+                            statut='En attente du document signé' WHERE id=?""", values + (main_ccp, main_cheque, main_student.get("adresse_domicile", ""), rid))
                     else:
                         cur = con.execute("""INSERT INTO demandes (date_soumission,departement,matricule,nom,prenom,nom_arabe,prenom_arabe,
                             promotion,groupe,sous_groupe,telephone,email,entreprise,secteur,adresse_entreprise,wilaya_entreprise,
@@ -889,8 +1028,10 @@ if page == "Demande de stage":
                             enseignant_superviseur,programme_stage,date_debut,date_fin,observations,wilaya_residence,ville_naissance,
                             wilaya_naissance,date_naissance,lieu_naissance,type_demande,participants_json,statut,ccp_number,cheque_barre,adresse_domicile)
                             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                            (values[-1], values[0], main_student["matricule"], *values[1:30], "Stage rémunéré", values[30], "En attente du document signé", str(ccp_number or "").strip(), sqlite3.Binary(cheque_file.getvalue()) if cheque_file else None, main_student.get("adresse_domicile", "")))
+                            (values[-1], values[0], main_student["matricule"], *values[1:30], "Stage rémunéré", values[30], "En attente du document signé", main_ccp, main_cheque, main_student.get("adresse_domicile", "")))
                         rid = cur.lastrowid
+                    # Dossiers individuels : un CCP et un chèque barré par étudiant.
+                    save_dossiers(con, rid, participants, cheque_by_key)
                     # L'autorisation de redépôt est à usage unique : elle est consommée
                     # au moment où la nouvelle demande est effectivement enregistrée.
                     matricules_a_consumer = [main_student.get("matricule", "")]
@@ -987,55 +1128,18 @@ elif page == "Administration":
         # supprime jamais les décisions de la base : elles continuent à bloquer
         # automatiquement une nouvelle demande pour les matricules concernés.
         with sqlite3.connect(DB_FILE) as con:
-            approved_data = pd.read_sql_query("""SELECT id, date_soumission, matricule, nom, prenom,
-                promotion, entreprise, sujet_stage, vice_dean_date, vice_dean_comment,
-                participants_json, COALESCE(historique_efface, 0) AS historique_efface
-                FROM demandes
-                WHERE TRIM(COALESCE(vice_dean_avis, '')) = 'Avis favorable'
-                  AND COALESCE(type_demande, 'Stage rémunéré') = 'Stage rémunéré'
-                ORDER BY id DESC""", con)
-
-        # Toutes les décisions restent consultables dans l'administration jusqu'au nettoyage intégral.
-        visible_approved = approved_data.copy()
-        approved_people = []
-        for _, approved in visible_approved.iterrows():
-            ref = f"STG-{int(approved['id']):05d}"
-            main_key = normalize_matricule(approved.get("matricule", ""))
-            if main_key:
-                approved_people.append({
-                    "Référence": ref, "Matricule": approved.get("matricule", ""),
-                    "Nom": approved.get("nom", ""), "Prénom": approved.get("prenom", ""),
-                    "Promotion": approved.get("promotion", ""),
-                    "Organisme d'accueil": approved.get("entreprise", ""),
-                    "Sujet du stage": approved.get("sujet_stage", ""),
-                    "Date de l'avis favorable": approved.get("vice_dean_date", ""),
-                    "Observation": approved.get("vice_dean_comment", ""),
-                })
-            try:
-                participants = json.loads(approved.get("participants_json") or "[]")
-            except (TypeError, ValueError, json.JSONDecodeError):
-                participants = []
-            if isinstance(participants, list):
-                for participant in participants:
-                    if not isinstance(participant, dict):
-                        continue
-                    participant_key = normalize_matricule(participant.get("matricule", ""))
-                    if not participant_key or participant_key == main_key:
-                        continue
-                    approved_people.append({
-                        "Référence": ref, "Matricule": participant.get("matricule", ""),
-                        "Nom": participant.get("nom", ""), "Prénom": participant.get("prenom", ""),
-                        "Promotion": participant.get("promotion", approved.get("promotion", "")),
-                        "Organisme d'accueil": approved.get("entreprise", ""),
-                        "Sujet du stage": approved.get("sujet_stage", ""),
-                        "Date de l'avis favorable": approved.get("vice_dean_date", ""),
-                        "Observation": approved.get("vice_dean_comment", ""),
-                    })
-
-        approved_people_df = pd.DataFrame(approved_people, columns=[
-            "Référence", "Matricule", "Nom", "Prénom", "Promotion",
-            "Organisme d'accueil", "Sujet du stage", "Date de l'avis favorable", "Observation"
-        ])
+            ensure_all_dossiers(con)
+            con.commit()
+            # Un avis favorable est porté par un ÉTUDIANT (dossier individuel), pas par la demande entière.
+            approved_people_df = pd.read_sql_query("""SELECT 'STG-' || printf('%05d', r.id) AS "Référence",
+                d.matricule AS "Matricule", d.nom AS "Nom", d.prenom AS "Prénom",
+                COALESCE(NULLIF(d.promotion, ''), r.promotion) AS "Promotion",
+                r.entreprise AS "Organisme d'accueil", r.sujet_stage AS "Sujet du stage",
+                d.vice_dean_date AS "Date de l'avis favorable", d.vice_dean_comment AS "Observation"
+                FROM dossiers_etudiants d JOIN demandes r ON r.id = d.demande_id
+                WHERE TRIM(COALESCE(d.vice_dean_avis, '')) = 'Avis favorable'
+                  AND COALESCE(r.type_demande, 'Stage rémunéré') = 'Stage rémunéré'
+                ORDER BY d.id DESC""", con)
         if not approved_people_df.empty:
             approved_people_df = approved_people_df.drop_duplicates(subset=["Matricule"])
         st.markdown("### 🎓 Demandeurs ayant obtenu un avis favorable")
@@ -1116,7 +1220,8 @@ elif page == "Administration":
             with sqlite3.connect(DB_FILE) as con:
                 con.execute("DELETE FROM demandes")
                 con.execute("DELETE FROM autorisations_nouveau_stage")
-                con.execute("DELETE FROM sqlite_sequence WHERE name IN ('demandes')")
+                con.execute("DELETE FROM dossiers_etudiants")
+                con.execute("DELETE FROM sqlite_sequence WHERE name IN ('demandes', 'dossiers_etudiants')")
                 con.commit()
             for session_key in ("active_request_id", "active_pdf"):
                 st.session_state.pop(session_key, None)
@@ -1155,7 +1260,8 @@ elif page == "Administration":
                         "Prénom": part.get("prenom", ""), "Nom arabe": part.get("nom_arabe", ""),
                         "Prénom arabe": part.get("prenom_arabe", ""), "Promotion": part.get("promotion", ""),
                         "Groupe": part.get("groupe", ""), "Sous-groupe": part.get("sous_groupe", ""),
-                        "Téléphone": part.get("telephone", ""), "E-mail": part.get("email", "")})
+                        "Téléphone": part.get("telephone", ""), "E-mail": part.get("email", ""),
+                        "N° CCP": part.get("ccp_number", "")})
             with pd.ExcelWriter(xlsx_buffer, engine="openpyxl") as writer:
                 export_data.to_excel(writer, index=False, sheet_name="Demandes")
                 pd.DataFrame(participant_rows).to_excel(writer, index=False, sheet_name="Participants")
@@ -1184,7 +1290,9 @@ elif page == "Chef de département":
         expected_chef = os.getenv("CHEF_DEPT_PASSWORD", admin_password())
     if pwd_chef and pwd_chef == expected_chef:
         with sqlite3.connect(DB_FILE) as con:
-            chef_data = pd.read_sql_query("SELECT id, date_soumission, matricule, nom, prenom, entreprise, sujet_stage, statut, signed_pdf, documents_docx, ccp_number, cheque_barre FROM demandes WHERE type_demande='Stage rémunéré' ORDER BY id DESC", con)
+            ensure_all_dossiers(con)
+            con.commit()
+            chef_data = pd.read_sql_query("SELECT id, date_soumission, matricule, nom, prenom, entreprise, sujet_stage, statut FROM demandes WHERE type_demande='Stage rémunéré' ORDER BY id DESC", con)
         if chef_data.empty:
             st.info("Aucune demande de stage.")
         else:
@@ -1193,42 +1301,79 @@ elif page == "Chef de département":
             with sqlite3.connect(DB_FILE) as con:
                 con.row_factory = sqlite3.Row
                 rec = con.execute("SELECT * FROM demandes WHERE id=?", (selected_chef,)).fetchone()
-            rec = dict(rec) if rec else {}
-            if rec.get("cheque_barre"):
-                cheque_bytes = bytes(rec["cheque_barre"])
-                cheque_ext = ".pdf" if cheque_bytes.startswith(b"%PDF") else (".png" if cheque_bytes.startswith(b"\x89PNG") else ".jpg")
-                cheque_mime = "application/pdf" if cheque_ext == ".pdf" else "image/png" if cheque_ext == ".png" else "image/jpeg"
-                st.download_button("Télécharger le chèque barré", cheque_bytes,
-                    f"Cheque_barre_STG-{selected_chef:05d}{cheque_ext}", cheque_mime)
-            if rec.get("ccp_number"):
-                st.info(f"Numéro CCP : {rec.get('ccp_number')}")
+                rec = dict(rec) if rec else {}
+                dossiers = [dict(x) for x in con.execute(
+                    "SELECT * FROM dossiers_etudiants WHERE demande_id=? ORDER BY id", (selected_chef,))]
+            st.write(f"**Statut de la demande :** {rec.get('statut') or '—'}")
             if rec.get("signed_pdf"):
                 st.download_button("Télécharger la demande signée par l'étudiant", bytes(rec["signed_pdf"]),
-                                   f"Demande_signee_STG-{selected_chef:05d}.pdf", "application/pdf")
-                st.markdown("### Génération des trois documents institutionnels")
-                st.caption("Le modèle conventions.docx fourni est rempli à partir des informations enregistrées dans la demande de l'étudiant.")
-                if st.button("Générer Attestation d’Assiduité, Convention de Stage et Attestation de Stage", type="primary"):
+                                   f"Demande_signee_STG-{selected_chef:05d}.pdf", "application/pdf",
+                                   key=f"chef_signed_{selected_chef}")
+                st.markdown("### Dossiers individuels des étudiants")
+                st.caption("Chaque étudiant a son propre CCP, son propre chèque barré et ses propres documents "
+                           "(Attestation d’Assiduité, Convention de Stage, Attestation de Stage), remplis avec ses informations personnelles.")
+                try:
+                    plist = json.loads(rec.get("participants_json") or "[]")
+                except Exception:
+                    plist = []
+                by_key = {normalize_matricule(p.get("matricule", "")): p for p in plist if isinstance(p, dict)}
+                nb_students = max(1, len(dossiers))
+
+                def generate_for(dos):
+                    student = dict(by_key.get(dos["matricule_key"]) or
+                                   {"matricule": dos["matricule"], "nom": dos["nom"], "prenom": dos["prenom"]})
+                    payload = build_three_stage_documents(rec, student, nb_students)
+                    stamp = datetime.now().isoformat(timespec="minutes")
+                    with sqlite3.connect(DB_FILE) as con_g:
+                        con_g.execute("UPDATE dossiers_etudiants SET documents_docx=?, documents_date=? WHERE id=?",
+                                      (sqlite3.Binary(payload), stamp, dos["id"]))
+                        refresh_request_status(con_g, selected_chef)
+                        con_g.commit()
+                    dos["documents_docx"] = payload
+                    dos["documents_date"] = stamp
+
+                if st.button("Générer les documents de TOUS les étudiants de cette demande", type="primary",
+                             key=f"gen_all_{selected_chef}"):
                     try:
-                        plist = json.loads(rec.get("participants_json") or "[]")
-                        payload = build_three_stage_documents(rec, plist)
-                        with sqlite3.connect(DB_FILE) as con:
-                            con.execute("""UPDATE demandes SET documents_docx=?, documents_date=?, statut=? WHERE id=?""",
-                                (sqlite3.Binary(payload), datetime.now().isoformat(timespec="minutes"),
-                                 "Documents générés - En attente de l'avis du Vice-doyen", selected_chef))
-                            con.commit()
-                        st.success("Les trois formulaires ont été remplis. Le dossier est transmis à l'espace du Vice-doyen pour avis.")
-                        st.download_button("Télécharger les trois documents remplis (DOCX)", payload,
-                            f"Documents_stage_STG-{selected_chef:05d}.docx",
-                            "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+                        for dos in dossiers:
+                            generate_for(dos)
+                        st.success("Les documents ont été remplis pour chaque étudiant (un jeu de documents par étudiant). "
+                                   "Chaque dossier est transmis individuellement à l'espace du Vice-doyen.")
                     except Exception as exc:
                         st.error(f"Impossible de générer les documents : {exc}")
-                if rec.get("documents_docx"):
-                    st.download_button("Télécharger les documents déjà générés", bytes(rec["documents_docx"]),
-                        f"Documents_stage_STG-{selected_chef:05d}.docx",
-                        "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
-                if rec.get("vice_dean_avis") == "Avis favorable":
-                    st.success("Avis favorable du Vice-doyen reçu. Le dossier est retourné au Chef de département.")
-                    st.info(rec.get("vice_dean_comment") or "Aucune observation.")
+
+                for dos in dossiers:
+                    avis_ok = (dos.get("vice_dean_avis") or "").strip() == "Avis favorable"
+                    titre = f"{dos.get('nom') or ''} {dos.get('prenom') or ''} — {dos.get('matricule') or ''}"
+                    with st.expander(("✅ " if avis_ok else "⏳ ") + titre, expanded=True):
+                        st.write(f"**Numéro CCP :** {dos.get('ccp_number') or 'Non renseigné'}")
+                        if dos.get("cheque_barre"):
+                            cheque_bytes = bytes(dos["cheque_barre"])
+                            cheque_ext = ".pdf" if cheque_bytes.startswith(b"%PDF") else (".png" if cheque_bytes.startswith(b"\x89PNG") else ".jpg")
+                            cheque_mime = "application/pdf" if cheque_ext == ".pdf" else "image/png" if cheque_ext == ".png" else "image/jpeg"
+                            st.download_button("Télécharger le chèque barré", cheque_bytes,
+                                f"Cheque_barre_STG-{selected_chef:05d}_{dos['matricule_key']}{cheque_ext}", cheque_mime,
+                                key=f"chef_cheque_{dos['id']}")
+                        else:
+                            st.warning("Chèque barré non fourni pour cet étudiant.")
+                        label_gen = "Régénérer les documents de cet étudiant" if dos.get("documents_docx") else "Générer les documents de cet étudiant"
+                        if st.button(label_gen, key=f"gen_{dos['id']}"):
+                            try:
+                                generate_for(dos)
+                                st.success("Documents générés pour cet étudiant et transmis au Vice-doyen.")
+                            except Exception as exc:
+                                st.error(f"Impossible de générer les documents : {exc}")
+                        if dos.get("documents_docx"):
+                            st.download_button("Télécharger les trois documents de cet étudiant (DOCX)", bytes(dos["documents_docx"]),
+                                f"Documents_stage_STG-{selected_chef:05d}_{dos['matricule_key']}.docx",
+                                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                                key=f"chef_docs_{dos['id']}")
+                            st.caption(f"Documents générés le {dos.get('documents_date') or '—'}")
+                        if avis_ok:
+                            st.success(f"Avis favorable du Vice-doyen reçu le {dos.get('vice_dean_date') or '—'}.")
+                            st.info(dos.get("vice_dean_comment") or "Aucune observation.")
+                        elif dos.get("documents_docx"):
+                            st.info("En attente de l'avis du Vice-doyen pour cet étudiant.")
             else:
                 st.warning("Le formulaire signé par l'étudiant n'est pas encore disponible.")
     elif pwd_chef:
@@ -1245,33 +1390,59 @@ elif page == "Vice-doyen":
         st.warning("Configurez VICE_DEAN_PASSWORD dans les secrets Streamlit pour activer cet espace.")
     elif pwd_vd and pwd_vd == expected_vd:
         with sqlite3.connect(DB_FILE) as con:
-            vd_data = pd.read_sql_query("""SELECT id, matricule, nom, prenom, entreprise, statut, documents_date,
-                documents_docx, vice_dean_avis, vice_dean_comment FROM demandes
-                WHERE documents_docx IS NOT NULL ORDER BY id DESC""", con)
+            ensure_all_dossiers(con)
+            con.commit()
+            # Un enregistrement PAR ÉTUDIANT : chacun reçoit son propre avis.
+            vd_data = pd.read_sql_query("""SELECT d.id AS dossier_id, d.demande_id, d.matricule, d.nom, d.prenom,
+                d.documents_date, d.vice_dean_avis, d.vice_dean_comment, r.entreprise, r.statut
+                FROM dossiers_etudiants d JOIN demandes r ON r.id = d.demande_id
+                WHERE d.documents_docx IS NOT NULL
+                ORDER BY d.demande_id DESC, d.id""", con)
+        flash_vd = st.session_state.pop("vd_flash", None)
+        if flash_vd:
+            st.success(flash_vd)
         if vd_data.empty:
             st.info("Aucun dossier n'attend un avis du Vice-doyen.")
         else:
-            pending_vd = vd_data[vd_data["vice_dean_avis"].isna() | (vd_data["vice_dean_avis"] == "")]
-            st.metric("Dossiers en attente d'avis", len(pending_vd))
-            selected_vd = st.selectbox("Dossier à examiner", vd_data["id"].tolist(),
-                format_func=lambda x: f"STG-{x:05d} — " + str(vd_data.loc[vd_data.id==x, "nom"].iloc[0]) + " " + str(vd_data.loc[vd_data.id==x, "prenom"].iloc[0]))
+            is_fav = vd_data["vice_dean_avis"].fillna("").astype(str).str.strip() == "Avis favorable"
+            st.metric("Étudiants en attente d'avis", int((~is_fav).sum()))
+            labels_vd = {}
+            for _, r_vd in vd_data.iterrows():
+                etat = "✅ Avis favorable" if str(r_vd["vice_dean_avis"] or "").strip() == "Avis favorable" else "⏳ En attente"
+                labels_vd[int(r_vd["dossier_id"])] = (
+                    f"STG-{int(r_vd['demande_id']):05d} — {r_vd['nom']} {r_vd['prenom']} ({r_vd['matricule']}) — {etat}")
+            selected_vd = st.selectbox("Étudiant / dossier à examiner", list(labels_vd.keys()),
+                                       format_func=lambda x: labels_vd.get(x, str(x)))
             with sqlite3.connect(DB_FILE) as con:
-                row_vd = con.execute("SELECT documents_docx, vice_dean_avis, vice_dean_comment FROM demandes WHERE id=?", (selected_vd,)).fetchone()
+                row_vd = con.execute("""SELECT documents_docx, vice_dean_avis, vice_dean_comment, demande_id,
+                    matricule, nom, prenom FROM dossiers_etudiants WHERE id=?""", (selected_vd,)).fetchone()
             if row_vd and row_vd[0]:
-                st.download_button("Consulter / télécharger les trois documents", bytes(row_vd[0]),
-                    f"Documents_stage_STG-{selected_vd:05d}.docx",
-                    "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
-                current_avis = row_vd[1] or ""
+                st.markdown(f"**Étudiant :** {row_vd[5]} {row_vd[6]} — {row_vd[4]}")
+                st.download_button("Consulter / télécharger les trois documents de cet étudiant", bytes(row_vd[0]),
+                    f"Documents_stage_STG-{int(row_vd[3]):05d}_{normalize_matricule(row_vd[4])}.docx",
+                    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    key=f"vd_dl_{selected_vd}")
+                current_avis = (row_vd[1] or "").strip()
                 st.write("Avis actuel :", current_avis or "En attente")
-                comment_vd = st.text_area("Observation du Vice-doyen", value=row_vd[2] or "", key=f"vd_comment_{selected_vd}")
-                if st.button("Accorder un avis favorable et transmettre au Chef de département", type="primary"):
-                    with sqlite3.connect(DB_FILE) as con:
-                        con.execute("""UPDATE demandes SET vice_dean_avis=?, vice_dean_date=?, vice_dean_comment=?,
-                            statut=? WHERE id=?""",
-                            ("Avis favorable", datetime.now().isoformat(timespec="minutes"), comment_vd,
-                             "Avis favorable du Vice-doyen - Retour au Chef de département", selected_vd))
-                        con.commit()
-                    st.success(f"Avis favorable enregistré pour STG-{selected_vd:05d}. Le dossier est maintenant visible par le Chef de département.")
+                if current_avis == "Avis favorable":
+                    st.success("Avis favorable déjà accordé à cet étudiant.")
+                    if row_vd[2]:
+                        st.info(row_vd[2])
+                else:
+                    comment_vd = st.text_area("Observation du Vice-doyen", value=row_vd[2] or "", key=f"vd_comment_{selected_vd}")
+                    if st.button("Accorder un avis favorable à cet étudiant et transmettre au Chef de département",
+                                 type="primary", key=f"vd_ok_{selected_vd}"):
+                        with sqlite3.connect(DB_FILE) as con:
+                            # Seul CET étudiant est concerné : les autres dossiers de la demande restent inchangés.
+                            con.execute("""UPDATE dossiers_etudiants SET vice_dean_avis=?, vice_dean_date=?, vice_dean_comment=?
+                                WHERE id=?""", ("Avis favorable", datetime.now().isoformat(timespec="minutes"),
+                                                comment_vd, selected_vd))
+                            refresh_request_status(con, int(row_vd[3]))
+                            con.commit()
+                        st.session_state["vd_flash"] = (
+                            f"Avis favorable enregistré pour {row_vd[5]} {row_vd[6]} (STG-{int(row_vd[3]):05d}). "
+                            "Les autres étudiants de la demande ne sont pas concernés.")
+                        st.rerun()
     elif pwd_vd:
         st.error("Mot de passe incorrect.")
 
