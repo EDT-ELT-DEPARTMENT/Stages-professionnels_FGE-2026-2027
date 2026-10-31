@@ -51,6 +51,17 @@ if not TEACHERS_FILE.exists():
         TEACHERS_FILE = candidates[0]
 DB_FILE = APP_DIR / "demandes_stages.db"
 SHEET_NAME = "Feuille1"
+DEPARTEMENTS_FGE = [
+    "Département d’électrotechnique",
+    "Département d’électronique",
+    "Département d’automatique",
+    "Département de télécommunications",
+]
+# Le fichier actuel des étudiants ne concerne que l'électrotechnique.
+DEPARTEMENT_ACTUEL = DEPARTEMENTS_FGE[0]
+LOGO_CANDIDATES = [APP_DIR / "logo_fge.png", APP_DIR / "logo.png", APP_DIR / "logo_fge.jpg", APP_DIR / "logo.jpg"]
+LOGO_FILE = next((p for p in LOGO_CANDIDATES if p.is_file()), None)
+
 PROMOTIONS_STAGE_REMUNERE = {
     "M1CE", "M1ER", "M1RE", "M1ME", "M2CE", "M2ER", "M2RE", "M2ME",
     "M1MCIL", "M2MCIL", "MCIL2", "MCIL3", "ING3EI", "ING3RSE",
@@ -137,7 +148,7 @@ def init_db():
         con.execute("""
         CREATE TABLE IF NOT EXISTS demandes (
           id INTEGER PRIMARY KEY AUTOINCREMENT, date_soumission TEXT NOT NULL,
-          matricule TEXT NOT NULL, nom TEXT, prenom TEXT, nom_arabe TEXT, prenom_arabe TEXT,
+          departement TEXT DEFAULT 'Département d’électrotechnique', matricule TEXT NOT NULL, nom TEXT, prenom TEXT, nom_arabe TEXT, prenom_arabe TEXT,
           promotion TEXT, groupe TEXT, sous_groupe TEXT, telephone TEXT, email TEXT,
           wilaya_residence TEXT, ville_naissance TEXT, wilaya_naissance TEXT,
           date_naissance TEXT, lieu_naissance TEXT,
@@ -153,6 +164,7 @@ def init_db():
         cols = {r[1] for r in con.execute("PRAGMA table_info(demandes)")}
         migrations = {
             "type_demande": "TEXT DEFAULT 'Stage rémunéré'",
+            "departement": "TEXT DEFAULT 'Département d’électrotechnique'",
             "participants_json": "TEXT DEFAULT '[]'",
             "statut": "TEXT DEFAULT 'Brouillon - formulaire à signer'",
             "signed_pdf": "BLOB",
@@ -269,11 +281,29 @@ def build_request_pdf(request_data, participants):
             ]
         return TableStyle(commands)
 
-    story = [
+    # En-tête avec logo en haut à gauche lorsqu'un fichier logo est fourni au projet.
+    from reportlab.platypus import Image as PDFImage
+    logo_cell = ""
+    if LOGO_FILE:
+        try:
+            logo_cell = PDFImage(str(LOGO_FILE), width=2.2*cm, height=2.2*cm, kind="proportional")
+        except Exception:
+            logo_cell = ""
+    header_text = [
         para("UNIVERSITÉ DJILLALI LIABÈS DE SIDI BEL ABBÈS", "CenterTitleFGE"),
         para("FACULTÉ DE GÉNIE ÉLECTRIQUE", "SectionFGE"),
+        para(request_data.get("departement", DEPARTEMENT_ACTUEL), "SmallFGE"),
         para("ANNÉE UNIVERSITAIRE 2026-2027", "SmallFGE"),
-        Spacer(1, 8),
+    ]
+    header_table = Table([[logo_cell, header_text]], colWidths=[2.6*cm, usable_width-2.6*cm], hAlign="LEFT")
+    header_table.setStyle(TableStyle([
+        ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
+        ("ALIGN", (0,0), (0,0), "LEFT"),
+        ("LEFTPADDING", (0,0), (-1,-1), 2), ("RIGHTPADDING", (0,0), (-1,-1), 2),
+        ("TOPPADDING", (0,0), (-1,-1), 2), ("BOTTOMPADDING", (0,0), (-1,-1), 2),
+    ]))
+    story = [
+        header_table, Spacer(1, 8),
         para("DEMANDE DE STAGE PROFESSIONNEL RÉMUNÉRÉ", "CenterTitleFGE"),
         Spacer(1, 8),
         para("Informations des étudiants demandeurs", "SectionFGE")
@@ -426,7 +456,19 @@ with st.sidebar:
     st.caption("FGE • 2026-2027")
 
 if page == "Demande de stage":
-    st.markdown('<div class="section">1. Identification du demandeur principal</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section">1. Département et identification du demandeur principal</div>', unsafe_allow_html=True)
+    # Liste déroulante informative et verrouillée : la base étudiante disponible est ELT uniquement.
+    if LOGO_FILE:
+        logo_col, dept_col = st.columns([1, 5])
+        with logo_col:
+            st.image(str(LOGO_FILE), width=105)
+        with dept_col:
+            st.selectbox("Département", options=DEPARTEMENTS_FGE, index=0, disabled=True,
+                         help="Le fichier des étudiants disponible concerne actuellement le département d’électrotechnique.")
+    else:
+        st.selectbox("Département", options=DEPARTEMENTS_FGE, index=0, disabled=True,
+                     help="Le fichier des étudiants disponible concerne actuellement le département d’électrotechnique.")
+    st.caption("Département sélectionné automatiquement : Département d’électrotechnique")
     matricule = st.text_input("Votre matricule étudiant", key="main_matricule",
                               placeholder="Saisissez votre matricule officiel")
     main_student = None
@@ -548,7 +590,8 @@ if page == "Demande de stage":
             if errors:
                 for e in errors: st.error(e)
             else:
-                req = {"entreprise":entreprise.strip(),"secteur":secteur.strip(),"adresse":adresse.strip(),
+                req = {"departement": DEPARTEMENT_ACTUEL,
+                       "entreprise":entreprise.strip(),"secteur":secteur.strip(),"adresse":adresse.strip(),
                        "wilaya":wilaya.strip(),"tel_ent":tel_ent.strip(),"email_ent":email_ent.strip(),
                        "responsable":responsable.strip(),"fonction":fonction.strip(),"sujet":sujet.strip(),
                        "domaine":domaine.strip(),
@@ -560,13 +603,13 @@ if page == "Demande de stage":
                 pdf = build_request_pdf(req, participants)
                 with sqlite3.connect(DB_FILE) as con:
                     cur = con.execute("""
-                    INSERT INTO demandes (date_soumission,matricule,nom,prenom,nom_arabe,prenom_arabe,
+                    INSERT INTO demandes (date_soumission,departement,matricule,nom,prenom,nom_arabe,prenom_arabe,
                     promotion,groupe,sous_groupe,telephone,email,entreprise,secteur,adresse_entreprise,
                     wilaya_entreprise,telephone_entreprise,email_entreprise,responsable,fonction_responsable,
                     sujet_stage,domaine_stage,enseignant_superviseur,programme_stage,date_debut,date_fin,observations,
                     wilaya_residence,ville_naissance,wilaya_naissance,date_naissance,lieu_naissance,type_demande,participants_json,statut)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                    """, (datetime.now().isoformat(timespec="seconds"),main_student["matricule"],
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    """, (datetime.now().isoformat(timespec="seconds"),req["departement"],main_student["matricule"],
                     main_student["nom"],main_student["prenom"],main_student["nom_arabe"],main_student["prenom_arabe"],
                     main_student["promotion"],main_student["groupe"],main_student["sous_groupe"],
                     main_student["telephone"],main_student["email"],req["entreprise"],req["secteur"],req["adresse"],
@@ -653,7 +696,7 @@ else:
         st.warning("Configurez ADMIN_PASSWORD dans les secrets Streamlit.")
     elif pwd and pwd == expected:
         with sqlite3.connect(DB_FILE) as con:
-            data = pd.read_sql_query("""SELECT id,date_soumission,matricule,nom,prenom,nom_arabe,prenom_arabe,promotion,
+            data = pd.read_sql_query("""SELECT id,date_soumission,departement,matricule,nom,prenom,nom_arabe,prenom_arabe,promotion,
                 wilaya_residence,ville_naissance,wilaya_naissance,date_naissance,lieu_naissance,enseignant_superviseur,programme_stage,
                 entreprise,sujet_stage,type_demande,statut,participants_json FROM demandes ORDER BY id DESC""",con)
         st.metric("Nombre total de demandes",len(data))
