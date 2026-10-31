@@ -251,6 +251,11 @@ def build_three_stage_documents(request_data, participants):
         "Sonatrach/division Production-Direction Régionale": company,
         "EL BGUEL.BP 113": address, "HASSI MESSAOUD /OUARGLA": wilaya,
         "saoudi abla": full_name,
+        # Le remplacement global de l'année transforme d'abord 2025-2026 en
+        # 2026-2027 : on cible donc explicitement la version finale du libellé.
+        "Inscrit (e) sous le Numéro.   …………………   .pour l’année universitaire 2026-2027:":
+            f"Inscrit (e) sous le Numéro.   {matricule}   .pour l’année universitaire 2026-2027:",
+        # Compatibilité avec un modèle qui conserverait encore l'année 2025-2026.
         "Inscrit (e) sous le Numéro.   …………………   .pour l’année universitaire 2025-2026:":
             f"Inscrit (e) sous le Numéro.   {matricule}   .pour l’année universitaire 2026-2027:",
         "09/09/2005": r.get("date_naissance", primary_student.get("date_naissance", "")),
