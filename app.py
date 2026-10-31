@@ -423,22 +423,74 @@ def favorable_dossiers_for(con, matricule_key):
     cols = [c[0] for c in cur.description]
     return [dict(zip(cols, row)) for row in cur.fetchall()]
 
+AVIS_FAV = "Avis favorable"
+AVIS_DEF = "Avis défavorable"
+
 def refresh_request_status(con, rid):
     """Met à jour le statut global de la demande à partir de l'état de chaque dossier individuel."""
-    rows = con.execute("""SELECT documents_docx IS NOT NULL, TRIM(COALESCE(vice_dean_avis, '')) = 'Avis favorable'
+    rows = con.execute("""SELECT documents_docx IS NOT NULL, TRIM(COALESCE(vice_dean_avis, ''))
         FROM dossiers_etudiants WHERE demande_id=?""", (rid,)).fetchall()
     if not rows:
         return
-    total, n_docs, n_fav = len(rows), sum(1 for r in rows if r[0]), sum(1 for r in rows if r[1])
-    if n_fav == total:
-        con.execute("UPDATE demandes SET statut=?, vice_dean_avis='Avis favorable' WHERE id=?",
-                    ("Avis favorable du Vice-doyen - Retour au Chef de département", rid))
-    elif n_fav > 0:
-        con.execute("UPDATE demandes SET statut=?, vice_dean_avis=NULL WHERE id=?",
-                    (f"Avis favorable pour {n_fav}/{total} étudiant(s) - En attente du Vice-doyen", rid))
+    total = len(rows)
+    n_docs = sum(1 for r in rows if r[0])
+    n_fav = sum(1 for r in rows if r[1] == AVIS_FAV)
+    n_def = sum(1 for r in rows if r[1] == AVIS_DEF)
+    n_done = n_fav + n_def
+    if n_done == total:
+        if n_def == 0:
+            statut, avis = "Avis favorable du Vice-doyen - Retour au Chef de département", AVIS_FAV
+        elif n_fav == 0:
+            statut, avis = "Avis défavorable du Vice-doyen - Retour au Chef de département", AVIS_DEF
+        else:
+            statut, avis = (f"Avis rendus ({n_fav} favorable(s), {n_def} défavorable(s)) - "
+                            "Retour au Chef de département"), None
+    elif n_done > 0:
+        statut, avis = (f"Avis rendus pour {n_done}/{total} étudiant(s) ({n_fav} favorable(s), "
+                        f"{n_def} défavorable(s)) - En attente du Vice-doyen"), None
     elif n_docs > 0:
-        con.execute("UPDATE demandes SET statut=?, vice_dean_avis=NULL WHERE id=?",
-                    ("Documents générés - En attente de l'avis du Vice-doyen", rid))
+        statut, avis = "Documents générés - En attente de l'avis du Vice-doyen", None
+    else:
+        return
+    con.execute("UPDATE demandes SET statut=?, vice_dean_avis=? WHERE id=?", (statut, avis, rid))
+
+def dossiers_export_df(con, where="", params=(), include_ccp=True):
+    """Une ligne par étudiant : sa demande et l'avis du Vice-doyen le concernant."""
+    sql = """SELECT r.id, d.matricule, d.nom, d.prenom, COALESCE(NULLIF(d.promotion, ''), r.promotion),
+            d.ccp_number, r.entreprise, r.sujet_stage, r.enseignant_superviseur, r.date_debut, r.date_fin,
+            r.date_soumission, r.statut, d.documents_docx IS NOT NULL, d.documents_date,
+            d.vice_dean_avis, d.vice_dean_date, d.vice_dean_comment
+        FROM dossiers_etudiants d JOIN demandes r ON r.id = d.demande_id
+        WHERE COALESCE(r.type_demande, 'Stage rémunéré') = 'Stage rémunéré'"""
+    if where:
+        sql += " AND (" + where + ")"
+    sql += " ORDER BY r.id DESC, d.id"
+    out = []
+    for r in con.execute(sql, params).fetchall():
+        avis = (r[15] or "").strip()
+        if not avis:
+            avis = "En attente de l'avis du Vice-doyen" if r[13] else "Dossier pas encore transmis au Vice-doyen"
+        row = {"Référence": f"STG-{int(r[0]):05d}", "Matricule": r[1], "Nom": r[2], "Prénom": r[3], "Promotion": r[4]}
+        if include_ccp:
+            row["N° CCP"] = r[5] or ""
+        row.update({"Entreprise": r[6], "Sujet du stage": r[7], "Enseignant superviseur": r[8],
+                    "Début": r[9], "Fin": r[10], "Date de soumission": r[11], "Statut de la demande": r[12],
+                    "Documents générés le": r[14] or "", "Avis du Vice-doyen": avis,
+                    "Date de l'avis": r[16] or "", "Observation / motif": r[17] or ""})
+        out.append(row)
+    return pd.DataFrame(out)
+
+def df_to_excel_bytes(df, sheet_name="Demandes et avis"):
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name=sheet_name)
+        ws = writer.sheets[sheet_name]
+        for idx, col in enumerate(df.columns, 1):
+            longest = max([len(str(col))] + [len(str(v)) for v in df[col].tolist()])
+            ws.column_dimensions[ws.cell(row=1, column=idx).column_letter].width = min(max(12, longest + 2), 60)
+    return buf.getvalue()
+
+XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
 def admin_password():
     try: return st.secrets.get("ADMIN_PASSWORD", os.getenv("ADMIN_PASSWORD", ""))
@@ -743,6 +795,19 @@ if page == "Demande de stage":
         if found.empty: st.error("Matricule introuvable dans le fichier source.")
         else:
             main_student = student_record(found.iloc[0])
+
+            # Mes demandes et l'avis rendu pour MOI (hors CCP) + export Excel.
+            with sqlite3.connect(DB_FILE) as con_x:
+                my_df = dossiers_export_df(con_x, "d.matricule_key=?", (normalize_matricule(main_student["matricule"]),),
+                                           include_ccp=False)
+            if not my_df.empty:
+                with st.expander("📋 Mes demandes et avis"):
+                    st.dataframe(my_df, use_container_width=True, hide_index=True)
+                    st.download_button("📊 Télécharger mes demandes et avis (Excel)", df_to_excel_bytes(my_df),
+                                       f"Mes_demandes_avis_{normalize_matricule(main_student['matricule'])}.xlsx",
+                                       XLSX_MIME, key="student_excel")
+                if (my_df["Avis du Vice-doyen"] == AVIS_DEF).any():
+                    st.info("Un avis défavorable a été rendu pour une de vos demandes précédentes : vous pouvez déposer une nouvelle demande.")
 
             # Blocage INDIVIDUEL : seul l'étudiant ayant lui-même reçu un avis favorable est bloqué.
             # Le co-stagiaire d'un binôme n'est pas concerné tant que son propre dossier n'a pas d'avis favorable.
@@ -1267,6 +1332,11 @@ elif page == "Administration":
                 pd.DataFrame(participant_rows).to_excel(writer, index=False, sheet_name="Participants")
             st.download_button("📊 Télécharger toutes les demandes en Excel", data=xlsx_buffer.getvalue(),
                 file_name="Demandes_stages_FGE_2026-2027.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            with sqlite3.connect(DB_FILE) as con_x:
+                all_df = dossiers_export_df(con_x)
+            if not all_df.empty:
+                st.download_button("📊 Excel — demandes par étudiant et leur avis", df_to_excel_bytes(all_df),
+                                   "Demandes_et_avis_FGE_2026-2027.xlsx", XLSX_MIME, key="admin_excel_avis")
             st.markdown("### Consulter le formulaire signé")
             selected=st.selectbox("Référence de demande",options=data["id"].tolist(),
                                   format_func=lambda x:f"STG-{x:05d}")
@@ -1296,6 +1366,11 @@ elif page == "Chef de département":
         if chef_data.empty:
             st.info("Aucune demande de stage.")
         else:
+            with sqlite3.connect(DB_FILE) as con_x:
+                chef_df = dossiers_export_df(con_x)
+            if not chef_df.empty:
+                st.download_button("📊 Excel — demandes par étudiant et leur avis", df_to_excel_bytes(chef_df),
+                                   "Demandes_et_avis_FGE_2026-2027.xlsx", XLSX_MIME, key="chef_excel")
             ids = chef_data["id"].tolist()
             selected_chef = st.selectbox("Demande à traiter", ids, format_func=lambda x: f"STG-{x:05d} — " + str(chef_data.loc[chef_data.id==x, "nom"].iloc[0]) + " " + str(chef_data.loc[chef_data.id==x, "prenom"].iloc[0]))
             with sqlite3.connect(DB_FILE) as con:
@@ -1343,9 +1418,10 @@ elif page == "Chef de département":
                         st.error(f"Impossible de générer les documents : {exc}")
 
                 for dos in dossiers:
-                    avis_ok = (dos.get("vice_dean_avis") or "").strip() == "Avis favorable"
+                    avis_ok = (dos.get("vice_dean_avis") or "").strip() == AVIS_FAV
+                    avis_def = (dos.get("vice_dean_avis") or "").strip() == AVIS_DEF
                     titre = f"{dos.get('nom') or ''} {dos.get('prenom') or ''} — {dos.get('matricule') or ''}"
-                    with st.expander(("✅ " if avis_ok else "⏳ ") + titre, expanded=True):
+                    with st.expander(("✅ " if avis_ok else "❌ " if avis_def else "⏳ ") + titre, expanded=True):
                         st.write(f"**Numéro CCP :** {dos.get('ccp_number') or 'Non renseigné'}")
                         if dos.get("cheque_barre"):
                             cheque_bytes = bytes(dos["cheque_barre"])
@@ -1372,6 +1448,10 @@ elif page == "Chef de département":
                         if avis_ok:
                             st.success(f"Avis favorable du Vice-doyen reçu le {dos.get('vice_dean_date') or '—'}.")
                             st.info(dos.get("vice_dean_comment") or "Aucune observation.")
+                        elif avis_def:
+                            st.error(f"Avis défavorable du Vice-doyen rendu le {dos.get('vice_dean_date') or '—'}.")
+                            st.info(dos.get("vice_dean_comment") or "Aucun motif indiqué.")
+                            st.caption("Cet étudiant n'est pas bloqué : il peut déposer une nouvelle demande.")
                         elif dos.get("documents_docx"):
                             st.info("En attente de l'avis du Vice-doyen pour cet étudiant.")
             else:
@@ -1401,14 +1481,23 @@ elif page == "Vice-doyen":
         flash_vd = st.session_state.pop("vd_flash", None)
         if flash_vd:
             st.success(flash_vd)
+        with sqlite3.connect(DB_FILE) as con_x:
+            vd_df = dossiers_export_df(con_x, "d.documents_docx IS NOT NULL")
+        if not vd_df.empty:
+            st.download_button("📊 Excel — dossiers par étudiant et leur avis", df_to_excel_bytes(vd_df),
+                               "Dossiers_et_avis_FGE_2026-2027.xlsx", XLSX_MIME, key="vd_excel")
         if vd_data.empty:
             st.info("Aucun dossier n'attend un avis du Vice-doyen.")
         else:
-            is_fav = vd_data["vice_dean_avis"].fillna("").astype(str).str.strip() == "Avis favorable"
-            st.metric("Étudiants en attente d'avis", int((~is_fav).sum()))
+            avis_series = vd_data["vice_dean_avis"].fillna("").astype(str).str.strip()
+            m1, m2, m3 = st.columns(3)
+            m1.metric("En attente d'avis", int((avis_series == "").sum()))
+            m2.metric("Avis favorables", int((avis_series == AVIS_FAV).sum()))
+            m3.metric("Avis défavorables", int((avis_series == AVIS_DEF).sum()))
             labels_vd = {}
             for _, r_vd in vd_data.iterrows():
-                etat = "✅ Avis favorable" if str(r_vd["vice_dean_avis"] or "").strip() == "Avis favorable" else "⏳ En attente"
+                a_vd = str(r_vd["vice_dean_avis"] or "").strip()
+                etat = "✅ Avis favorable" if a_vd == AVIS_FAV else "❌ Avis défavorable" if a_vd == AVIS_DEF else "⏳ En attente"
                 labels_vd[int(r_vd["dossier_id"])] = (
                     f"STG-{int(r_vd['demande_id']):05d} — {r_vd['nom']} {r_vd['prenom']} ({r_vd['matricule']}) — {etat}")
             selected_vd = st.selectbox("Étudiant / dossier à examiner", list(labels_vd.keys()),
@@ -1424,24 +1513,39 @@ elif page == "Vice-doyen":
                     key=f"vd_dl_{selected_vd}")
                 current_avis = (row_vd[1] or "").strip()
                 st.write("Avis actuel :", current_avis or "En attente")
-                if current_avis == "Avis favorable":
+                if current_avis == AVIS_FAV:
                     st.success("Avis favorable déjà accordé à cet étudiant.")
                     if row_vd[2]:
                         st.info(row_vd[2])
                 else:
-                    comment_vd = st.text_area("Observation du Vice-doyen", value=row_vd[2] or "", key=f"vd_comment_{selected_vd}")
-                    if st.button("Accorder un avis favorable à cet étudiant et transmettre au Chef de département",
-                                 type="primary", key=f"vd_ok_{selected_vd}"):
+                    if current_avis == AVIS_DEF:
+                        st.error("Avis défavorable déjà rendu : l'étudiant n'est pas bloqué et peut déposer une nouvelle demande. "
+                                 "Vous pouvez encore changer la décision ci-dessous.")
+                    comment_vd = st.text_area("Observation / motif du Vice-doyen", value=row_vd[2] or "", key=f"vd_comment_{selected_vd}")
+                    b_fav, b_def = st.columns(2)
+                    click_fav = b_fav.button("✅ Accorder un avis favorable à cet étudiant", type="primary",
+                                             key=f"vd_ok_{selected_vd}", use_container_width=True)
+                    click_def = b_def.button("❌ Rendre un avis défavorable", key=f"vd_ko_{selected_vd}",
+                                             use_container_width=True)
+                    if click_def and not comment_vd.strip():
+                        st.error("Veuillez indiquer le motif de l'avis défavorable dans l'observation.")
+                    elif click_fav or click_def:
+                        nouvel_avis = AVIS_FAV if click_fav else AVIS_DEF
                         with sqlite3.connect(DB_FILE) as con:
                             # Seul CET étudiant est concerné : les autres dossiers de la demande restent inchangés.
                             con.execute("""UPDATE dossiers_etudiants SET vice_dean_avis=?, vice_dean_date=?, vice_dean_comment=?
-                                WHERE id=?""", ("Avis favorable", datetime.now().isoformat(timespec="minutes"),
+                                WHERE id=?""", (nouvel_avis, datetime.now().isoformat(timespec="minutes"),
                                                 comment_vd, selected_vd))
                             refresh_request_status(con, int(row_vd[3]))
                             con.commit()
-                        st.session_state["vd_flash"] = (
-                            f"Avis favorable enregistré pour {row_vd[5]} {row_vd[6]} (STG-{int(row_vd[3]):05d}). "
-                            "Les autres étudiants de la demande ne sont pas concernés.")
+                        if click_fav:
+                            st.session_state["vd_flash"] = (
+                                f"Avis favorable enregistré pour {row_vd[5]} {row_vd[6]} (STG-{int(row_vd[3]):05d}). "
+                                "Les autres étudiants de la demande ne sont pas concernés.")
+                        else:
+                            st.session_state["vd_flash"] = (
+                                f"Avis défavorable enregistré pour {row_vd[5]} {row_vd[6]} (STG-{int(row_vd[3]):05d}). "
+                                "L'étudiant n'est pas bloqué et pourra déposer une nouvelle demande.")
                         st.rerun()
     elif pwd_vd:
         st.error("Mot de passe incorrect.")
