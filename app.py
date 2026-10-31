@@ -59,7 +59,7 @@ DEPARTEMENTS_FGE = [
 ]
 # Le fichier actuel des étudiants ne concerne que l'électrotechnique.
 DEPARTEMENT_ACTUEL = DEPARTEMENTS_FGE[0]
-LOGO_CANDIDATES = [APP_DIR / "logo_fge.png", APP_DIR / "logo.png", APP_DIR / "logo_fge.jpg", APP_DIR / "logo.jpg"]
+LOGO_CANDIDATES = [APP_DIR / "logo.PNG", APP_DIR / "logo.png", APP_DIR / "logo_fge.png", APP_DIR / "Logo.PNG", APP_DIR / "logo_fge.jpg", APP_DIR / "logo.jpg"]
 LOGO_FILE = next((p for p in LOGO_CANDIDATES if p.is_file()), None)
 
 PROMOTIONS_STAGE_REMUNERE = {
