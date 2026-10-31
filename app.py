@@ -743,7 +743,7 @@ if page == "Demande de stage":
             observations = st.text_area("Observations", value=(pending_request or {}).get("observations", ""))
             st.markdown("**Coordonnées CCP et chèque barré**")
             ccp_col, cheque_col = st.columns([1, 1])
-            ccp_number = ccp_col.text_input("Numéro CCP de l’étudiant", value=(pending_request or {}).get("ccp_number", ""), placeholder="Numéro CCP")
+            ccp_number = ccp_col.text_input("Numéro CCP de l’étudiant", value=str((pending_request or {}).get("ccp_number") or ""), placeholder="Numéro CCP")
             cheque_file = cheque_col.file_uploader("Téléverser le chèque barré (image ou PDF)", type=["pdf", "png", "jpg", "jpeg"], key="cheque_barre_upload")
             create = st.form_submit_button("📄 Générer le formulaire à faire signer", use_container_width=True)
 
@@ -770,7 +770,7 @@ if page == "Demande de stage":
                        "programme":programme.strip(),
                        "debut":debut.isoformat(),"fin":fin.isoformat(),
                        "observations":observations.strip(),
-                       "ccp_number":ccp_number.strip(),
+                       "ccp_number":str(ccp_number or "").strip(),
                        "adresse_domicile":main_student.get("adresse_domicile", "")}
                 pdf = build_request_pdf(req, participants)
                 with sqlite3.connect(DB_FILE) as con:
@@ -791,7 +791,7 @@ if page == "Demande de stage":
                             enseignant_superviseur=?,programme_stage=?,date_debut=?,date_fin=?,observations=?,wilaya_residence=?,
                             ville_naissance=?,wilaya_naissance=?,date_naissance=?,lieu_naissance=?,participants_json=?,date_soumission=?,
                             ccp_number=?,cheque_barre=COALESCE(?,cheque_barre),adresse_domicile=?,
-                            statut='En attente du document signé' WHERE id=?""", values + (ccp_number.strip(), sqlite3.Binary(cheque_file.getvalue()) if cheque_file else None, main_student.get("adresse_domicile", ""), rid))
+                            statut='En attente du document signé' WHERE id=?""", values + (str(ccp_number or "").strip(), sqlite3.Binary(cheque_file.getvalue()) if cheque_file else None, main_student.get("adresse_domicile", ""), rid))
                     else:
                         cur = con.execute("""INSERT INTO demandes (date_soumission,departement,matricule,nom,prenom,nom_arabe,prenom_arabe,
                             promotion,groupe,sous_groupe,telephone,email,entreprise,secteur,adresse_entreprise,wilaya_entreprise,
@@ -799,7 +799,7 @@ if page == "Demande de stage":
                             enseignant_superviseur,programme_stage,date_debut,date_fin,observations,wilaya_residence,ville_naissance,
                             wilaya_naissance,date_naissance,lieu_naissance,type_demande,participants_json,statut,ccp_number,cheque_barre,adresse_domicile)
                             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                            (values[-1], values[0], main_student["matricule"], *values[1:30], "Stage rémunéré", values[30], "En attente du document signé", ccp_number.strip(), sqlite3.Binary(cheque_file.getvalue()) if cheque_file else None, main_student.get("adresse_domicile", "")))
+                            (values[-1], values[0], main_student["matricule"], *values[1:30], "Stage rémunéré", values[30], "En attente du document signé", str(ccp_number or "").strip(), sqlite3.Binary(cheque_file.getvalue()) if cheque_file else None, main_student.get("adresse_domicile", "")))
                         rid = cur.lastrowid
                     con.commit()
                 st.session_state["active_request_id"] = rid
