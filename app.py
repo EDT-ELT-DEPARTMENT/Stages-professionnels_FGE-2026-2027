@@ -286,7 +286,7 @@ def build_request_pdf(request_data, participants):
     logo_cell = ""
     if LOGO_FILE:
         try:
-            logo_cell = PDFImage(str(LOGO_FILE), width=2.2*cm, height=2.2*cm, kind="proportional")
+            logo_cell = PDFImage(str(LOGO_FILE), width=3.8*cm, height=3.8*cm, kind="proportional")
         except Exception:
             logo_cell = ""
     header_text = [
@@ -295,7 +295,7 @@ def build_request_pdf(request_data, participants):
         para(request_data.get("departement", DEPARTEMENT_ACTUEL), "SmallFGE"),
         para("ANNÉE UNIVERSITAIRE 2026-2027", "SmallFGE"),
     ]
-    header_table = Table([[logo_cell, header_text]], colWidths=[2.6*cm, usable_width-2.6*cm], hAlign="LEFT")
+    header_table = Table([[logo_cell, header_text]], colWidths=[4.2*cm, usable_width-4.2*cm], hAlign="LEFT")
     header_table.setStyle(TableStyle([
         ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
         ("ALIGN", (0,0), (0,0), "LEFT"),
@@ -459,9 +459,9 @@ if page == "Demande de stage":
     st.markdown('<div class="section">1. Département et identification du demandeur principal</div>', unsafe_allow_html=True)
     # Liste déroulante informative et verrouillée : la base étudiante disponible est ELT uniquement.
     if LOGO_FILE:
-        logo_col, dept_col = st.columns([1, 5])
+        logo_col, dept_col = st.columns([2, 5], vertical_alignment="center")
         with logo_col:
-            st.image(str(LOGO_FILE), width=105)
+            st.image(str(LOGO_FILE), width=240)
         with dept_col:
             st.selectbox("Département", options=DEPARTEMENTS_FGE, index=0, disabled=True,
                          help="Le fichier des étudiants disponible concerne actuellement le département d’électrotechnique.")
