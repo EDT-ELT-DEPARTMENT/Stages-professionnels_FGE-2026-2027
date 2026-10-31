@@ -313,6 +313,13 @@ def init_db():
         }
         for col, typ in migrations.items():
             if col not in cols: con.execute(f"ALTER TABLE demandes ADD COLUMN {col} {typ}")
+        # Dérogation nominative et à usage unique après un avis favorable.
+        con.execute("""CREATE TABLE IF NOT EXISTS autorisations_nouveau_stage (
+            matricule_key TEXT PRIMARY KEY,
+            matricule TEXT,
+            autorise_le TEXT NOT NULL,
+            motif TEXT DEFAULT ''
+        )""")
         con.commit()
 
 def admin_password():
@@ -626,6 +633,10 @@ if page == "Demande de stage":
             favorable_previous_requests = []
             with sqlite3.connect(DB_FILE) as con:
                 con.row_factory = sqlite3.Row
+                reapply_authorized = con.execute(
+                    "SELECT 1 FROM autorisations_nouveau_stage WHERE matricule_key=?",
+                    (matricule_key,)
+                ).fetchone() is not None
                 favorable_rows = con.execute("""
                     SELECT id, matricule, nom, prenom, promotion, entreprise,
                            sujet_stage, vice_dean_avis, vice_dean_date,
@@ -657,7 +668,7 @@ if page == "Demande de stage":
                 if found_in_previous:
                     favorable_previous_requests.append(previous)
 
-            if favorable_previous_requests:
+            if favorable_previous_requests and not reapply_authorized:
                 previous = favorable_previous_requests[0]
                 st.error(
                     "⛔ Un avis favorable a déjà été accordé pour ce matricule. "
@@ -678,6 +689,15 @@ if page == "Demande de stage":
                     "par l'administration, veuillez contacter le service responsable."
                 )
                 st.stop()
+            elif favorable_previous_requests and reapply_authorized:
+                previous = favorable_previous_requests[0]
+                st.warning(
+                    "⚠️ Mention administrative : vous avez déjà obtenu un avis favorable "
+                    "pour un stage précédent. Une autorisation exceptionnelle vous permet "
+                    "de déposer cette nouvelle demande."
+                )
+                st.caption(f"Avis favorable précédent : STG-{int(previous['id']):05d} — "
+                           f"{previous.get('vice_dean_date') or 'date non renseignée'}.")
 
             if norm_promo(main_student["promotion"]) not in PROMOTIONS_STAGE_REMUNERE:
                 st.warning(f"Votre promotion ({main_student['promotion']}) n'est pas éligible au stage rémunéré. Vous êtes orienté(e) vers la visite en entreprise.")
@@ -871,6 +891,16 @@ if page == "Demande de stage":
                             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                             (values[-1], values[0], main_student["matricule"], *values[1:30], "Stage rémunéré", values[30], "En attente du document signé", str(ccp_number or "").strip(), sqlite3.Binary(cheque_file.getvalue()) if cheque_file else None, main_student.get("adresse_domicile", "")))
                         rid = cur.lastrowid
+                    # L'autorisation de redépôt est à usage unique : elle est consommée
+                    # au moment où la nouvelle demande est effectivement enregistrée.
+                    matricules_a_consumer = [main_student.get("matricule", "")]
+                    matricules_a_consumer.extend(
+                        part.get("matricule", "") for part in participants if isinstance(part, dict)
+                    )
+                    for matricule_consume in matricules_a_consumer:
+                        key_consume = normalize_matricule(matricule_consume)
+                        if key_consume:
+                            con.execute("DELETE FROM autorisations_nouveau_stage WHERE matricule_key=?", (key_consume,))
                     con.commit()
                 st.session_state["active_request_id"] = rid
                 st.session_state["active_pdf"] = pdf
@@ -965,7 +995,8 @@ elif page == "Administration":
                   AND COALESCE(type_demande, 'Stage rémunéré') = 'Stage rémunéré'
                 ORDER BY id DESC""", con)
 
-        visible_approved = approved_data[approved_data["historique_efface"] == 0].copy() if not approved_data.empty else approved_data.copy()
+        # Toutes les décisions restent consultables dans l'administration jusqu'au nettoyage intégral.
+        visible_approved = approved_data.copy()
         approved_people = []
         for _, approved in visible_approved.iterrows():
             ref = f"STG-{int(approved['id']):05d}"
@@ -1017,23 +1048,80 @@ elif page == "Administration":
             st.download_button("⬇️ Exporter la liste des avis favorables (CSV)", approved_csv,
                 "Demandeurs_avis_favorables_FGE_2026-2027.csv", "text/csv")
 
-        if not approved_data.empty:
-            st.markdown("#### Gestion de l'historique des avis favorables")
-            st.caption("L'effacement masque la liste et remet le compteur d'affichage à zéro, mais conserve les décisions en base afin que le contrôle automatique des matricules continue de fonctionner.")
-            confirm_clear_history = st.checkbox(
-                "Je confirme vouloir effacer l'historique affiché des avis favorables.",
-                key="confirm_clear_favorable_history"
+        st.markdown("#### Autoriser exceptionnellement un nouveau dépôt")
+        st.caption("Sélectionnez un bénéficiaire ayant déjà reçu un avis favorable. L'autorisation permet un seul nouveau dépôt et la plateforme affiche alors une mention rappelant l'avis favorable précédent.")
+        if not approved_people_df.empty:
+            grant_options = approved_people_df["Matricule"].astype(str).dropna().unique().tolist()
+            grant_labels = {
+                str(row["Matricule"]): f"{row['Nom']} {row['Prénom']} — {row['Matricule']} — {row['Référence']}"
+                for _, row in approved_people_df.iterrows()
+            }
+            selected_grant_matricule = st.selectbox(
+                "Demandeur à autoriser pour un nouveau stage",
+                options=grant_options,
+                format_func=lambda x: grant_labels.get(str(x), str(x)),
+                key="grant_new_stage_matricule"
             )
-            if st.button("🗑️ Effacer l'historique affiché", type="secondary",
-                         disabled=not confirm_clear_history,
-                         key="clear_favorable_history_button"):
+            grant_reason = st.text_input(
+                "Motif / observation de l'autorisation (facultatif)",
+                key="grant_new_stage_reason"
+            )
+            if st.button("🔓 Autoriser un nouveau dépôt (une seule fois)", key="grant_new_stage_button"):
+                key_grant = normalize_matricule(selected_grant_matricule)
                 with sqlite3.connect(DB_FILE) as con:
-                    con.execute("""UPDATE demandes SET historique_efface=1
-                        WHERE TRIM(COALESCE(vice_dean_avis, '')) = 'Avis favorable'
-                          AND COALESCE(type_demande, 'Stage rémunéré') = 'Stage rémunéré'""")
+                    con.execute("""INSERT INTO autorisations_nouveau_stage
+                        (matricule_key, matricule, autorise_le, motif) VALUES (?, ?, ?, ?)
+                        ON CONFLICT(matricule_key) DO UPDATE SET
+                        matricule=excluded.matricule, autorise_le=excluded.autorise_le,
+                        motif=excluded.motif""",
+                        (key_grant, selected_grant_matricule,
+                         datetime.now().isoformat(timespec="minutes"), grant_reason.strip()))
                     con.commit()
-                st.success("Historique masqué. Les décisions restent conservées et les matricules restent protégés contre un nouveau dépôt.")
+                st.success("Autorisation enregistrée. Le demandeur pourra déposer une seule nouvelle demande.")
                 st.rerun()
+        else:
+            st.info("Aucun bénéficiaire disponible pour une autorisation de redépôt.")
+
+        with sqlite3.connect(DB_FILE) as con:
+            active_permissions = pd.read_sql_query(
+                "SELECT matricule, autorise_le, motif FROM autorisations_nouveau_stage ORDER BY autorise_le DESC", con
+            )
+        if not active_permissions.empty:
+            st.markdown("##### Autorisations de redépôt en attente d'utilisation")
+            st.dataframe(active_permissions, use_container_width=True, hide_index=True)
+
+        st.divider()
+        st.markdown("#### 🧹 Nettoyage intégral de la plateforme")
+        st.warning(
+            "Cette opération supprime définitivement toutes les demandes enregistrées dans la base, "
+            "quel que soit leur type (stage rémunéré, visite, brouillon ou dossier traité), "
+            "ainsi que les PDF/documents stockés dans ces demandes et toutes les autorisations de redépôt. "
+            "Les compteurs et historiques de tous les espaces seront remis à zéro."
+        )
+        st.caption("Les fichiers Excel sources, les paramètres/secrets et les fichiers du programme ne seront pas supprimés.")
+        confirm_purge = st.checkbox(
+            "Je comprends que cette suppression est définitive et concerne tous les espaces.",
+            key="confirm_full_platform_purge"
+        )
+        purge_phrase = st.text_input(
+            "Pour confirmer, tapez exactement : EFFACER TOUT",
+            key="full_platform_purge_phrase"
+        )
+        if st.button(
+            "⚠️ SUPPRIMER DÉFINITIVEMENT TOUT L'HISTORIQUE",
+            type="primary",
+            disabled=not (confirm_purge and purge_phrase.strip() == "EFFACER TOUT"),
+            key="purge_all_platform_history"
+        ):
+            with sqlite3.connect(DB_FILE) as con:
+                con.execute("DELETE FROM demandes")
+                con.execute("DELETE FROM autorisations_nouveau_stage")
+                con.execute("DELETE FROM sqlite_sequence WHERE name IN ('demandes')")
+                con.commit()
+            for session_key in ("active_request_id", "active_pdf"):
+                st.session_state.pop(session_key, None)
+            st.success("Nettoyage terminé : toutes les demandes et tous les historiques de la base ont été supprimés.")
+            st.rerun()
 
         if data.empty: st.info("Aucune demande enregistrée.")
         else:
