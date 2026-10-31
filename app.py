@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """Plateforme des stages professionnels et visites en entreprise — FGE 2026-2027."""
 from pathlib import Path
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 import os, re, sqlite3, json, io
 import html
 import base64, zlib, tempfile
@@ -126,6 +126,7 @@ def student_record(row):
         "wilaya_naissance": first_value(row, "Wilaya de naissance", "Wilaya de naissance.1"),
         "promotion": first_value(row, "Promotion"), "groupe": first_value(row, "Groupe"),
         "sous_groupe": first_value(row, "Sous groupe"),
+        "adresse_domicile": first_value(row, "Adresse", "Adresse du domicile", "Adresse domicile"),
         "telephone": first_value(row, "N° de téléphone"),
         "email": first_value(row, "E-mail institutionnel", "email"),
         "mat_bac": first_value(row, "Mat. BAC"),
@@ -157,12 +158,72 @@ def _replace_docx_paragraph(paragraph, replacements):
         # paragraphe évite de laisser des morceaux de l'exemple dans le document.
         paragraph.text = updated
 
+JOURS_FR = ["lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche"]
+
+# Jours fériés algériens. Les fêtes religieuses sont des dates prévisionnelles :
+# elles peuvent être décalées selon l'annonce officielle de l'observation lunaire.
+FERIES_ALGERIE = {
+    "2026-01-01": "Jour de l’An", "2026-01-12": "Yennayer",
+    "2026-03-20": "Aïd el-Fitr", "2026-03-21": "Aïd el-Fitr", "2026-03-22": "Aïd el-Fitr",
+    "2026-05-01": "Fête du Travail", "2026-05-27": "Aïd el-Adha",
+    "2026-05-28": "Aïd el-Adha", "2026-05-29": "Aïd el-Adha",
+    "2026-06-16": "Awal Mouharram (date prévisionnelle)",
+    "2026-06-25": "Achoura (date prévisionnelle)", "2026-07-05": "Fête de l’Indépendance",
+    "2026-08-25": "Mawlid Ennabaoui (date prévisionnelle)",
+    "2026-11-01": "Anniversaire de la Révolution",
+    "2027-01-01": "Jour de l’An", "2027-01-12": "Yennayer",
+    "2027-03-10": "Aïd el-Fitr (date prévisionnelle)",
+    "2027-03-11": "Aïd el-Fitr (date prévisionnelle)",
+    "2027-03-12": "Aïd el-Fitr (date prévisionnelle)",
+    "2027-05-01": "Fête du Travail",
+    "2027-05-17": "Aïd el-Adha (date prévisionnelle)",
+    "2027-05-18": "Aïd el-Adha (date prévisionnelle)",
+    "2027-05-19": "Aïd el-Adha (date prévisionnelle)",
+    "2027-06-06": "Awal Mouharram (date prévisionnelle)",
+    "2027-06-15": "Achoura (date prévisionnelle)",
+    "2027-07-05": "Fête de l’Indépendance",
+    "2027-08-15": "Mawlid Ennabaoui (date prévisionnelle)",
+    "2027-11-01": "Anniversaire de la Révolution",
+}
+
+def date_fr_complete(d):
+    mois = ["janvier", "février", "mars", "avril", "mai", "juin", "juillet", "août", "septembre", "octobre", "novembre", "décembre"]
+    return f"{JOURS_FR[d.weekday()]} {d.day} {mois[d.month-1]} {d.year}"
+
+def remplir_tableau_assiduite(doc, date_debut, date_fin):
+    try:
+        debut = date.fromisoformat(str(date_debut)[:10])
+        fin = date.fromisoformat(str(date_fin)[:10])
+    except Exception:
+        return
+    table = next((t for t in doc.tables if len(t.rows) >= 16 and len(t.columns) >= 3 and "Observation" in t.cell(0,2).text), None)
+    if table is None:
+        return
+    current = debut
+    for idx in range(1, min(16, len(table.rows))):
+        if current > fin:
+            table.cell(idx,1).text = "—"
+            table.cell(idx,2).text = "—"
+            continue
+        table.cell(idx,1).text = date_fr_complete(current)
+        holiday = FERIES_ALGERIE.get(current.isoformat())
+        if current.weekday() in (4,5):
+            label = "Vendredi" if current.weekday() == 4 else "Samedi"
+            table.cell(idx,2).text = f"Non comptabilisé — {label}"
+        elif holiday:
+            table.cell(idx,2).text = f"Non comptabilisé — {holiday}"
+        else:
+            table.cell(idx,2).text = ""
+        current += timedelta(days=1)
+
 def build_three_stage_documents(request_data, participants):
     """Remplit le modèle institutionnel fourni (assiduité + convention + attestation)."""
     if not CONVENTION_TEMPLATE.is_file():
         raise FileNotFoundError("Le modèle conventions.docx est absent du dépôt GitHub.")
     doc = Document(str(CONVENTION_TEMPLATE))
+    remplir_tableau_assiduite(doc, request_data.get("date_debut", ""), request_data.get("date_fin", ""))
     r = request_data
+    primary_student = participants[0] if participants else {}
     full_name = f'{r.get("nom","")} {r.get("prenom","")}'.strip()
     company = r.get("entreprise", "")
     address = r.get("adresse_entreprise", "")
@@ -217,7 +278,7 @@ def init_db():
           date_debut TEXT, date_fin TEXT, observations TEXT,
           type_demande TEXT DEFAULT 'Stage rémunéré',
           participants_json TEXT DEFAULT '[]', statut TEXT DEFAULT 'Brouillon - formulaire à signer',
-          signed_pdf BLOB
+          signed_pdf BLOB, adresse_domicile TEXT, ccp_number TEXT, cheque_barre BLOB
         )""")
         cols = {r[1] for r in con.execute("PRAGMA table_info(demandes)")}
         migrations = {
@@ -230,6 +291,7 @@ def init_db():
             "vice_dean_date": "TEXT", "vice_dean_comment": "TEXT",
             "wilaya_residence": "TEXT", "ville_naissance": "TEXT", "wilaya_naissance": "TEXT",
             "date_naissance": "TEXT", "lieu_naissance": "TEXT",
+            "adresse_domicile": "TEXT", "ccp_number": "TEXT", "cheque_barre": "BLOB",
             "enseignant_superviseur": "TEXT", "programme_stage": "TEXT",
         }
         for col, typ in migrations.items():
@@ -394,8 +456,10 @@ def build_request_pdf(request_data, participants):
              para("Ville de naissance", "LabelFGE"), para(get("ville_naissance"))],
             [para("Wilaya de résidence", "LabelFGE"), para(get("wilaya_residence")),
              para("Wilaya de naissance", "LabelFGE"), para(get("wilaya_naissance"))],
-            [para("Téléphone", "LabelFGE"), para(phone),
-             para("E-mail", "LabelFGE"), para(email_value)],
+            [para("Adresse du domicile", "LabelFGE"), para(get("adresse_domicile")),
+             para("Téléphone", "LabelFGE"), para(phone)],
+            [para("E-mail", "LabelFGE"), para(email_value),
+             para("N° CCP", "LabelFGE"), para(request_data.get("ccp_number", ""))],
         ])
     student_table = LongTable(rows, colWidths=student_widths, repeatRows=0, hAlign="LEFT")
     student_table.setStyle(table_style())
@@ -622,6 +686,7 @@ if page == "Demande de stage":
                 student["wilaya_residence"] = a1.text_input("Wilaya de résidence", value=student.get("wilaya_residence", ""), key=f"edit_wilaya_res_{idx}_{student.get('matricule','')}")
                 student["wilaya_naissance"] = a2.text_input("Wilaya de naissance", value=student.get("wilaya_naissance", ""), key=f"edit_wilaya_naiss_{idx}_{student.get('matricule','')}")
                 student["ville_naissance"] = a1.text_input("Ville de naissance (source)", value=student.get("ville_naissance", ""), key=f"edit_ville_naiss_{idx}_{student.get('matricule','')}")
+                student["adresse_domicile"] = a2.text_input("Adresse du domicile", value=student.get("adresse_domicile", ""), key=f"edit_adresse_dom_{idx}_{student.get('matricule','')}")
                 student["telephone"] = a2.text_input("Téléphone", value=student.get("telephone", ""), key=f"edit_tel_{idx}_{student.get('matricule','')}")
                 student["email"] = a1.text_input("E-mail", value=student.get("email", ""), key=f"edit_email_{idx}_{student.get('matricule','')}")
             corrected_participants.append(student)
@@ -637,6 +702,7 @@ if page == "Demande de stage":
             "Matricule": p["matricule"], "Nom": p["nom"], "Prénom": p["prenom"],
             "Nom arabe": p.get("nom_arabe", ""), "Prénom arabe": p.get("prenom_arabe", ""),
             "Date de naissance": p.get("date_naissance", ""), "Lieu de naissance": p.get("lieu_naissance", ""),
+            "Adresse domicile": p.get("adresse_domicile", ""),
             "Promotion": p["promotion"], "Groupe": p["groupe"], "Sous-groupe": p["sous_groupe"]
         } for p in participants]), use_container_width=True, hide_index=True)
 
@@ -667,6 +733,10 @@ if page == "Demande de stage":
             debut = d1.date_input("Date prévue de début", value=default_debut)
             fin = d2.date_input("Date prévue de fin", value=default_fin)
             observations = st.text_area("Observations", value=(pending_request or {}).get("observations", ""))
+            st.markdown("**Coordonnées CCP et chèque barré**")
+            ccp_col, cheque_col = st.columns([1, 1])
+            ccp_number = ccp_col.text_input("Numéro CCP de l’étudiant", value=(pending_request or {}).get("ccp_number", ""), placeholder="Numéro CCP")
+            cheque_file = cheque_col.file_uploader("Téléverser le chèque barré (image ou PDF)", type=["pdf", "png", "jpg", "jpeg"], key="cheque_barre_upload")
             create = st.form_submit_button("📄 Générer le formulaire à faire signer", use_container_width=True)
 
         if create:
@@ -691,7 +761,9 @@ if page == "Demande de stage":
                        "superviseur":superviseur.strip(),
                        "programme":programme.strip(),
                        "debut":debut.isoformat(),"fin":fin.isoformat(),
-                       "observations":observations.strip()}
+                       "observations":observations.strip(),
+                       "ccp_number":ccp_number.strip(),
+                       "adresse_domicile":main_student.get("adresse_domicile", "")}
                 pdf = build_request_pdf(req, participants)
                 with sqlite3.connect(DB_FILE) as con:
                     values = (req["departement"], main_student["nom"], main_student["prenom"],
@@ -710,15 +782,16 @@ if page == "Demande de stage":
                             telephone_entreprise=?,email_entreprise=?,responsable=?,fonction_responsable=?,sujet_stage=?,domaine_stage=?,
                             enseignant_superviseur=?,programme_stage=?,date_debut=?,date_fin=?,observations=?,wilaya_residence=?,
                             ville_naissance=?,wilaya_naissance=?,date_naissance=?,lieu_naissance=?,participants_json=?,date_soumission=?,
-                            statut='En attente du document signé' WHERE id=?""", values + (rid,))
+                            ccp_number=?,cheque_barre=COALESCE(?,cheque_barre),adresse_domicile=?,
+                            statut='En attente du document signé' WHERE id=?""", values + (ccp_number.strip(), sqlite3.Binary(cheque_file.getvalue()) if cheque_file else None, main_student.get("adresse_domicile", ""), rid))
                     else:
                         cur = con.execute("""INSERT INTO demandes (date_soumission,departement,matricule,nom,prenom,nom_arabe,prenom_arabe,
                             promotion,groupe,sous_groupe,telephone,email,entreprise,secteur,adresse_entreprise,wilaya_entreprise,
                             telephone_entreprise,email_entreprise,responsable,fonction_responsable,sujet_stage,domaine_stage,
                             enseignant_superviseur,programme_stage,date_debut,date_fin,observations,wilaya_residence,ville_naissance,
-                            wilaya_naissance,date_naissance,lieu_naissance,type_demande,participants_json,statut)
-                            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                            (values[-1], values[0], main_student["matricule"], *values[1:30], "Stage rémunéré", values[30], "En attente du document signé"))
+                            wilaya_naissance,date_naissance,lieu_naissance,type_demande,participants_json,statut,ccp_number,cheque_barre,adresse_domicile)
+                            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                            (values[-1], values[0], main_student["matricule"], *values[1:30], "Stage rémunéré", values[30], "En attente du document signé", ccp_number.strip(), sqlite3.Binary(cheque_file.getvalue()) if cheque_file else None, main_student.get("adresse_domicile", "")))
                         rid = cur.lastrowid
                     con.commit()
                 st.session_state["active_request_id"] = rid
@@ -862,7 +935,7 @@ elif page == "Chef de département":
         expected_chef = os.getenv("CHEF_DEPT_PASSWORD", admin_password())
     if pwd_chef and pwd_chef == expected_chef:
         with sqlite3.connect(DB_FILE) as con:
-            chef_data = pd.read_sql_query("SELECT id, date_soumission, matricule, nom, prenom, entreprise, sujet_stage, statut, signed_pdf, documents_docx FROM demandes WHERE type_demande='Stage rémunéré' ORDER BY id DESC", con)
+            chef_data = pd.read_sql_query("SELECT id, date_soumission, matricule, nom, prenom, entreprise, sujet_stage, statut, signed_pdf, documents_docx, ccp_number, cheque_barre FROM demandes WHERE type_demande='Stage rémunéré' ORDER BY id DESC", con)
         if chef_data.empty:
             st.info("Aucune demande de stage.")
         else:
@@ -872,6 +945,14 @@ elif page == "Chef de département":
                 con.row_factory = sqlite3.Row
                 rec = con.execute("SELECT * FROM demandes WHERE id=?", (selected_chef,)).fetchone()
             rec = dict(rec) if rec else {}
+            if rec.get("cheque_barre"):
+                cheque_bytes = bytes(rec["cheque_barre"])
+                cheque_ext = ".pdf" if cheque_bytes.startswith(b"%PDF") else (".png" if cheque_bytes.startswith(b"\x89PNG") else ".jpg")
+                cheque_mime = "application/pdf" if cheque_ext == ".pdf" else "image/png" if cheque_ext == ".png" else "image/jpeg"
+                st.download_button("Télécharger le chèque barré", cheque_bytes,
+                    f"Cheque_barre_STG-{selected_chef:05d}{cheque_ext}", cheque_mime)
+            if rec.get("ccp_number"):
+                st.info(f"Numéro CCP : {rec.get('ccp_number')}")
             if rec.get("signed_pdf"):
                 st.download_button("Télécharger la demande signée par l'étudiant", bytes(rec["signed_pdf"]),
                                    f"Demande_signee_STG-{selected_chef:05d}.pdf", "application/pdf")
