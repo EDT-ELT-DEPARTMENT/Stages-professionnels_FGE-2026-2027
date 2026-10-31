@@ -483,7 +483,20 @@ if page == "Demande de stage":
                 st.stop()
             st.success(f"Étudiant reconnu : {main_student['nom']} {main_student['prenom']} — {main_student['promotion']}")
 
+    pending_request = None
     if main_student:
+        # Reprendre la dernière demande envoyée mais dont le document signé manque.
+        with sqlite3.connect(DB_FILE) as con:
+            row_pending = con.execute(
+                "SELECT * FROM demandes WHERE matricule=? AND type_demande='Stage rémunéré' AND signed_pdf IS NULL ORDER BY id DESC LIMIT 1",
+                (normalize_matricule(main_student["matricule"]),)
+            ).fetchone()
+            if row_pending:
+                cols_pending = [d[1] for d in con.execute("PRAGMA table_info(demandes)")]
+                pending_request = dict(zip(cols_pending, row_pending))
+        if pending_request:
+            st.info(f"Une demande existe déjà pour votre matricule (référence STG-{pending_request['id']:05d}). "
+                    "Son document signé n'a pas encore été déposé. Vos informations sont reprises ci-dessous : vous pouvez les modifier et régénérer le formulaire.")
         with st.container(border=True):
             st.markdown("**Coordonnées du demandeur principal (issues du fichier source)**")
             st.write(f"**{main_student['nom']} {main_student['prenom']}** — {main_student['matricule']}")
@@ -495,8 +508,20 @@ if page == "Demande de stage":
 
         st.markdown('<div class="section">2. Ajouter un ou plusieurs camarades</div>', unsafe_allow_html=True)
         st.write("Saisissez les matricules des camarades, un matricule par ligne. Tous les participants doivent appartenir aux promotions autorisées.")
+        pending_participants = []
+        if pending_request:
+            try: pending_participants = json.loads(pending_request.get("participants_json") or "[]")
+            except Exception: pending_participants = []
+        default_companions = "\n".join(str(x.get("matricule", "")) for x in pending_participants[1:] if x.get("matricule"))
         companions_text = st.text_area("Matricules des camarades (facultatif)", height=110,
+                                       value=default_companions,
                                        placeholder="Exemple :\n252538288004\n262638574206")
+        # Reprendre aussi les corrections individuelles déjà enregistrées pour chaque participant.
+        pending_by_matricule = {normalize_matricule(x.get("matricule", "")): x for x in pending_participants}
+        if pending_by_matricule:
+            main_saved = pending_by_matricule.get(normalize_matricule(main_student["matricule"]))
+            if main_saved:
+                main_student.update({k: v for k, v in main_saved.items() if k in main_student})
         participants = [main_student]
         companion_errors = []
         seen = {normalize_matricule(main_student["matricule"])}
@@ -512,6 +537,9 @@ if page == "Demande de stage":
                 companion_errors.append(f"Matricule introuvable : {mk}")
                 continue
             record = student_record(match.iloc[0])
+            saved_record = pending_by_matricule.get(mk)
+            if saved_record:
+                record.update({k: v for k, v in saved_record.items() if k in record})
             if norm_promo(record["promotion"]) not in PROMOTIONS_STAGE_REMUNERE:
                 companion_errors.append(f"{record['nom']} {record['prenom']} ({record['promotion']}) n'est pas éligible au stage rémunéré.")
                 continue
@@ -555,26 +583,30 @@ if page == "Demande de stage":
         st.markdown('<div class="section">4. Informations sur l’entreprise et le stage</div>', unsafe_allow_html=True)
         with st.form("stage_group_form"):
             c1,c2 = st.columns(2)
-            entreprise = c1.text_input("Nom de l'entreprise *")
-            secteur = c2.text_input("Secteur d'activité")
-            adresse = c1.text_area("Adresse complète *", height=80)
-            wilaya = c2.text_input("Wilaya / commune")
-            tel_ent = c1.text_input("Téléphone de l'entreprise")
-            email_ent = c2.text_input("E-mail de l'entreprise")
-            responsable = c1.text_input("Nom du responsable d'accueil")
-            fonction = c2.text_input("Fonction du responsable")
-            sujet = st.text_input("Sujet / intitulé du stage *")
+            entreprise = c1.text_input("Nom de l'entreprise *", value=(pending_request or {}).get("entreprise", ""))
+            secteur = c2.text_input("Secteur d'activité", value=(pending_request or {}).get("secteur", ""))
+            adresse = c1.text_area("Adresse complète *", value=(pending_request or {}).get("adresse_entreprise", ""), height=80)
+            wilaya = c2.text_input("Wilaya / commune", value=(pending_request or {}).get("wilaya_entreprise", ""))
+            tel_ent = c1.text_input("Téléphone de l'entreprise", value=(pending_request or {}).get("telephone_entreprise", ""))
+            email_ent = c2.text_input("E-mail de l'entreprise", value=(pending_request or {}).get("email_entreprise", ""))
+            responsable = c1.text_input("Nom du responsable d'accueil", value=(pending_request or {}).get("responsable", ""))
+            fonction = c2.text_input("Fonction du responsable", value=(pending_request or {}).get("fonction_responsable", ""))
+            sujet = st.text_input("Sujet / intitulé du stage *", value=(pending_request or {}).get("sujet_stage", ""))
             domaine = st.text_input("Service ou domaine d'affectation")
             superviseur = st.selectbox("Enseignant chargé de superviser le stage (Permanent uniquement) *",
-                                       options=permanent_teachers,
+                                       options=permanent_teachers, index=(permanent_teachers.index(pending_request.get("enseignant_superviseur")) if pending_request and pending_request.get("enseignant_superviseur") in permanent_teachers else 0),
                                        help="La liste est extraite du fichier des enseignants et filtrée sur la qualité Permanent.")
             programme = st.text_area("Programme détaillé du stage *",
-                                     height=150,
+                                     value=(pending_request or {}).get("programme_stage", ""), height=150,
                                      placeholder="Décrivez les activités prévues, les travaux à réaliser et les objectifs du stage.")
             d1,d2 = st.columns(2)
-            debut = d1.date_input("Date prévue de début", value=date.today())
-            fin = d2.date_input("Date prévue de fin", value=date.today())
-            observations = st.text_area("Observations")
+            try: default_debut = date.fromisoformat(str(pending_request.get("date_debut"))) if pending_request and pending_request.get("date_debut") else date.today()
+            except Exception: default_debut = date.today()
+            try: default_fin = date.fromisoformat(str(pending_request.get("date_fin"))) if pending_request and pending_request.get("date_fin") else date.today()
+            except Exception: default_fin = date.today()
+            debut = d1.date_input("Date prévue de début", value=default_debut)
+            fin = d2.date_input("Date prévue de fin", value=default_fin)
+            observations = st.text_area("Observations", value=(pending_request or {}).get("observations", ""))
             create = st.form_submit_button("📄 Générer le formulaire à faire signer", use_container_width=True)
 
         if create:
@@ -602,23 +634,32 @@ if page == "Demande de stage":
                        "observations":observations.strip()}
                 pdf = build_request_pdf(req, participants)
                 with sqlite3.connect(DB_FILE) as con:
-                    cur = con.execute("""
-                    INSERT INTO demandes (date_soumission,departement,matricule,nom,prenom,nom_arabe,prenom_arabe,
-                    promotion,groupe,sous_groupe,telephone,email,entreprise,secteur,adresse_entreprise,
-                    wilaya_entreprise,telephone_entreprise,email_entreprise,responsable,fonction_responsable,
-                    sujet_stage,domaine_stage,enseignant_superviseur,programme_stage,date_debut,date_fin,observations,
-                    wilaya_residence,ville_naissance,wilaya_naissance,date_naissance,lieu_naissance,type_demande,participants_json,statut)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                    """, (datetime.now().isoformat(timespec="seconds"),req["departement"],main_student["matricule"],
-                    main_student["nom"],main_student["prenom"],main_student["nom_arabe"],main_student["prenom_arabe"],
-                    main_student["promotion"],main_student["groupe"],main_student["sous_groupe"],
-                    main_student["telephone"],main_student["email"],req["entreprise"],req["secteur"],req["adresse"],
-                    req["wilaya"],req["tel_ent"],req["email_ent"],req["responsable"],req["fonction"],req["sujet"],
-                    req["domaine"],req["superviseur"],req["programme"],req["debut"],req["fin"],req["observations"],
-                    main_student["wilaya_residence"],main_student["ville_naissance"],main_student["wilaya_naissance"],
-                    main_student["date_naissance"],main_student["lieu_naissance"],
-                    "Stage rémunéré",json.dumps(participants,ensure_ascii=False),"Brouillon - formulaire à signer"))
-                    rid = cur.lastrowid
+                    values = (req["departement"], main_student["nom"], main_student["prenom"],
+                        main_student["nom_arabe"], main_student["prenom_arabe"], main_student["promotion"],
+                        main_student["groupe"], main_student["sous_groupe"], main_student["telephone"], main_student["email"],
+                        req["entreprise"], req["secteur"], req["adresse"], req["wilaya"], req["tel_ent"], req["email_ent"],
+                        req["responsable"], req["fonction"], req["sujet"], req["domaine"], req["superviseur"],
+                        req["programme"], req["debut"], req["fin"], req["observations"],
+                        main_student["wilaya_residence"], main_student["ville_naissance"], main_student["wilaya_naissance"],
+                        main_student["date_naissance"], main_student["lieu_naissance"],
+                        json.dumps(participants, ensure_ascii=False), datetime.now().isoformat(timespec="seconds"))
+                    if pending_request:
+                        rid = int(pending_request["id"])
+                        con.execute("""UPDATE demandes SET departement=?,nom=?,prenom=?,nom_arabe=?,prenom_arabe=?,promotion=?,
+                            groupe=?,sous_groupe=?,telephone=?,email=?,entreprise=?,secteur=?,adresse_entreprise=?,wilaya_entreprise=?,
+                            telephone_entreprise=?,email_entreprise=?,responsable=?,fonction_responsable=?,sujet_stage=?,domaine_stage=?,
+                            enseignant_superviseur=?,programme_stage=?,date_debut=?,date_fin=?,observations=?,wilaya_residence=?,
+                            ville_naissance=?,wilaya_naissance=?,date_naissance=?,lieu_naissance=?,participants_json=?,date_soumission=?,
+                            statut='En attente du document signé' WHERE id=?""", values + (rid,))
+                    else:
+                        cur = con.execute("""INSERT INTO demandes (date_soumission,departement,matricule,nom,prenom,nom_arabe,prenom_arabe,
+                            promotion,groupe,sous_groupe,telephone,email,entreprise,secteur,adresse_entreprise,wilaya_entreprise,
+                            telephone_entreprise,email_entreprise,responsable,fonction_responsable,sujet_stage,domaine_stage,
+                            enseignant_superviseur,programme_stage,date_debut,date_fin,observations,wilaya_residence,ville_naissance,
+                            wilaya_naissance,date_naissance,lieu_naissance,type_demande,participants_json,statut)
+                            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                            (values[-1], values[0], main_student["matricule"], *values[1:30], "Stage rémunéré", values[30], "En attente du document signé"))
+                        rid = cur.lastrowid
                     con.commit()
                 st.session_state["active_request_id"] = rid
                 st.session_state["active_pdf"] = pdf
@@ -719,6 +760,25 @@ else:
             st.dataframe(data.drop(columns=["participants_json"]),use_container_width=True,hide_index=True)
             csv=data.drop(columns=["participants_json"]).to_csv(index=False).encode("utf-8-sig")
             st.download_button("⬇️ Exporter les demandes CSV",csv,"Demandes_stages_FGE_2026-2027.csv","text/csv")
+            # Export Excel multi-feuilles : demandes principales + détail des participants.
+            xlsx_buffer = io.BytesIO()
+            export_data = data.drop(columns=["participants_json"]).copy()
+            participant_rows = []
+            for _, rec in data.iterrows():
+                try: plist = json.loads(rec.get("participants_json") or "[]")
+                except Exception: plist = []
+                for part in plist:
+                    participant_rows.append({"Référence": f"STG-{int(rec['id']):05d}", "Matricule demandeur": rec.get("matricule", ""),
+                        "Matricule participant": part.get("matricule", ""), "Nom": part.get("nom", ""),
+                        "Prénom": part.get("prenom", ""), "Nom arabe": part.get("nom_arabe", ""),
+                        "Prénom arabe": part.get("prenom_arabe", ""), "Promotion": part.get("promotion", ""),
+                        "Groupe": part.get("groupe", ""), "Sous-groupe": part.get("sous_groupe", ""),
+                        "Téléphone": part.get("telephone", ""), "E-mail": part.get("email", "")})
+            with pd.ExcelWriter(xlsx_buffer, engine="openpyxl") as writer:
+                export_data.to_excel(writer, index=False, sheet_name="Demandes")
+                pd.DataFrame(participant_rows).to_excel(writer, index=False, sheet_name="Participants")
+            st.download_button("📊 Télécharger toutes les demandes en Excel", data=xlsx_buffer.getvalue(),
+                file_name="Demandes_stages_FGE_2026-2027.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
             st.markdown("### Consulter le formulaire signé")
             selected=st.selectbox("Référence de demande",options=data["id"].tolist(),
                                   format_func=lambda x:f"STG-{x:05d}")
