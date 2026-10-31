@@ -16,6 +16,13 @@ APP_DIR = Path(__file__).resolve().parent
 SOURCE_FILE = APP_DIR / "Liste des étudiants_2026-2027.xlsx"
 DB_FILE = APP_DIR / "demandes_stages.db"
 SHEET_NAME = "Feuille1"
+# Seules ces promotions peuvent déposer une demande de stage rémunéré.
+PROMOTIONS_STAGE_REMUNERE = {
+    "M1CE", "M1ER", "M1RE", "M1ME",
+    "M2CE", "M2ER", "M2RE", "M2ME",
+    "M1MCIL", "M2MCIL", "MCIL2", "MCIL3",
+    "ING3EI", "ING3RSE", "ING4EI", "ING4RSE", "ING5RSE",
+}
 
 st.set_page_config(
     page_title="Stages professionnels FGE 2026-2027",
@@ -102,9 +109,14 @@ def init_db():
             wilaya_entreprise TEXT, telephone_entreprise TEXT,
             email_entreprise TEXT, responsable TEXT, fonction_responsable TEXT,
             sujet_stage TEXT, domaine_stage TEXT, date_debut TEXT, date_fin TEXT,
-            observations TEXT
+            observations TEXT,
+            type_demande TEXT DEFAULT 'Stage rémunéré'
         )
         """)
+        # Migration automatique pour les bases créées avec une ancienne version.
+        colonnes = [row[1] for row in con.execute("PRAGMA table_info(demandes)").fetchall()]
+        if "type_demande" not in colonnes:
+            con.execute("ALTER TABLE demandes ADD COLUMN type_demande TEXT DEFAULT 'Stage rémunéré'")
         con.commit()
 
 
@@ -185,7 +197,36 @@ if page == "Demande de stage":
             c3.text_input("Téléphone étudiant", value=telephone, disabled=True)
             st.text_input("Adresse e-mail", value=email, disabled=True)
 
-        st.markdown('<div class="section">2. Informations sur l’entreprise d’accueil</div>', unsafe_allow_html=True)
+        promotion_key = re.sub(r"\s+", "", promotion.upper())
+        stage_remunere = promotion_key in PROMOTIONS_STAGE_REMUNERE
+
+        if stage_remunere:
+            st.success(
+                f"Votre promotion ({promotion}) est éligible au dépôt d’une demande de stage rémunéré."
+            )
+            type_demande = "Stage rémunéré"
+            titre_formulaire = "Demande de stage rémunéré"
+            libelle_sujet = "Intitulé / sujet proposé du stage *"
+            bouton = "📨 Envoyer la demande de stage rémunéré"
+        else:
+            st.warning(
+                f"Votre promotion ({promotion or 'non renseignée'}) ne figure pas dans la liste "
+                "des promotions autorisées pour les stages rémunérés. "
+                "Vous êtes donc orienté(e) vers une demande de visite en entreprise."
+            )
+            st.info(
+                "Cette orientation est automatique et repose sur la promotion indiquée "
+                "dans le fichier officiel des étudiants."
+            )
+            type_demande = "Visite en entreprise"
+            titre_formulaire = "Demande de visite en entreprise"
+            libelle_sujet = "Objet / thème de la visite *"
+            bouton = "📨 Envoyer la demande de visite"
+
+        st.markdown(
+            f'<div class="section">2. {titre_formulaire} — entreprise d’accueil</div>',
+            unsafe_allow_html=True,
+        )
         with st.form("stage_application", clear_on_submit=False):
             a1, a2 = st.columns(2)
             entreprise = a1.text_input("Nom de l’entreprise *")
@@ -197,22 +238,30 @@ if page == "Demande de stage":
             responsable = a1.text_input("Nom et prénom du responsable d’accueil")
             fonction = a2.text_input("Fonction du responsable")
 
-            st.markdown('<div class="section">3. Informations sur le stage</div>', unsafe_allow_html=True)
-            sujet = st.text_input("Intitulé / sujet proposé du stage *")
-            domaine = st.text_input("Service ou domaine d’affectation")
-            d1, d2 = st.columns(2)
-            debut = d1.date_input("Date prévue de début", value=date.today())
-            fin = d2.date_input("Date prévue de fin", value=date.today())
+            if stage_remunere:
+                st.markdown('<div class="section">3. Informations sur le stage</div>', unsafe_allow_html=True)
+                sujet = st.text_input(libelle_sujet)
+                domaine = st.text_input("Service ou domaine d’affectation")
+                d1, d2 = st.columns(2)
+                debut = d1.date_input("Date prévue de début", value=date.today())
+                fin = d2.date_input("Date prévue de fin", value=date.today())
+            else:
+                st.markdown('<div class="section">3. Informations sur la visite</div>', unsafe_allow_html=True)
+                sujet = st.text_input(libelle_sujet)
+                domaine = st.text_input("Service / unité à visiter")
+                debut = st.date_input("Date souhaitée de la visite", value=date.today())
+                fin = debut
             observations = st.text_area("Observations complémentaires")
             st.caption("* Champs obligatoires.")
-            submitted = st.form_submit_button("📨 Envoyer la demande", use_container_width=True)
+            submitted = st.form_submit_button(bouton, use_container_width=True)
 
         if submitted:
             errors = []
             if not entreprise.strip(): errors.append("Le nom de l’entreprise est obligatoire.")
             if not adresse.strip(): errors.append("L’adresse de l’entreprise est obligatoire.")
-            if not sujet.strip(): errors.append("L’intitulé du stage est obligatoire.")
-            if fin < debut: errors.append("La date de fin doit être postérieure ou égale à la date de début.")
+            if not sujet.strip(): errors.append("L’intitulé ou l’objet est obligatoire.")
+            if stage_remunere and fin < debut:
+                errors.append("La date de fin doit être postérieure ou égale à la date de début.")
             if errors:
                 for err in errors:
                     st.error(err)
@@ -225,19 +274,22 @@ if page == "Demande de stage":
                       entreprise, secteur, adresse_entreprise, wilaya_entreprise,
                       telephone_entreprise, email_entreprise, responsable,
                       fonction_responsable, sujet_stage, domaine_stage, date_debut,
-                      date_fin, observations
-                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                      date_fin, observations, type_demande
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                     """, (
                         date.today().isoformat(), normalize_matricule(matricule),
                         nom, prenom, nom_ar, prenom_ar, promotion, groupe, sous_groupe,
                         telephone, email, entreprise.strip(), secteur.strip(), adresse.strip(),
                         wilaya.strip(), tel_ent.strip(), email_ent.strip(), responsable.strip(),
                         fonction.strip(), sujet.strip(), domaine.strip(), debut.isoformat(),
-                        fin.isoformat(), observations.strip()
+                        fin.isoformat(), observations.strip(), type_demande
                     ))
                     demande_id = cur.lastrowid
                     con.commit()
-                st.success(f"Votre demande a été enregistrée. Numéro de suivi : STG-{demande_id:05d}")
+                st.success(
+                    f"Votre {('demande de stage rémunéré' if stage_remunere else 'demande de visite')} "
+                    f"a été enregistrée. Numéro de suivi : STG-{demande_id:05d}"
+                )
                 st.info("Conservez ce numéro pour le suivi administratif de votre demande.")
 
     else:
