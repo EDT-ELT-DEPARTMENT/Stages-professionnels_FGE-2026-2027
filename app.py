@@ -11,9 +11,20 @@ from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.enums import TA_CENTER
 from reportlab.lib.units import cm
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
 
 APP_DIR = Path(__file__).resolve().parent
 SOURCE_FILE = APP_DIR / "Liste des étudiants_2026-2027.xlsx"
+if not SOURCE_FILE.exists():
+    candidates = sorted(APP_DIR.glob("Liste des étudiants*.xlsx"))
+    if candidates:
+        SOURCE_FILE = candidates[0]
+TEACHERS_FILE = APP_DIR / "Permanents-Vacataires-ELT2-2026-2027.xlsx"
+if not TEACHERS_FILE.exists():
+    candidates = sorted(APP_DIR.glob("Permanents-Vacataires*.xlsx"))
+    if candidates:
+        TEACHERS_FILE = candidates[0]
 DB_FILE = APP_DIR / "demandes_stages.db"
 SHEET_NAME = "Feuille1"
 PROMOTIONS_STAGE_REMUNERE = {
@@ -68,12 +79,29 @@ def student_record(row):
         "matricule": first_value(row, "Mat. Etudiant"),
         "nom": first_value(row, "Nom"), "prenom": first_value(row, "Prénom"),
         "nom_arabe": first_value(row, "اللقب"), "prenom_arabe": first_value(row, "الإسم"),
+        "wilaya_residence": first_value(row, "Wilaya de résidence"),
+        "ville_naissance": first_value(row, "Ville de naissance"),
+        "wilaya_naissance": first_value(row, "Wilaya de naissance", "Wilaya de naissance.1"),
         "promotion": first_value(row, "Promotion"), "groupe": first_value(row, "Groupe"),
         "sous_groupe": first_value(row, "Sous groupe"),
         "telephone": first_value(row, "N° de téléphone"),
         "email": first_value(row, "E-mail institutionnel", "email"),
         "mat_bac": first_value(row, "Mat. BAC"),
     }
+
+@st.cache_data
+def load_permanent_teachers(path, modified_time):
+    df = pd.read_excel(path, sheet_name="Permanents-Vacataires", dtype=object)
+    required = ["NOM", "PRÉNOM", "Qualité"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError("Colonnes absentes du fichier des enseignants : " + ", ".join(missing))
+    quality = df["Qualité"].astype(str).str.strip().str.casefold()
+    df = df[quality.isin({"permanent", "permanente"})].copy()
+    df["_label"] = (df["NOM"].fillna("").astype(str).str.strip() + " " +
+                    df["PRÉNOM"].fillna("").astype(str).str.strip()).str.strip()
+    df = df[df["_label"] != ""].drop_duplicates("_label")
+    return sorted(df["_label"].tolist(), key=lambda x: x.casefold())
 
 def init_db():
     with sqlite3.connect(DB_FILE) as con:
@@ -82,9 +110,11 @@ def init_db():
           id INTEGER PRIMARY KEY AUTOINCREMENT, date_soumission TEXT NOT NULL,
           matricule TEXT NOT NULL, nom TEXT, prenom TEXT, nom_arabe TEXT, prenom_arabe TEXT,
           promotion TEXT, groupe TEXT, sous_groupe TEXT, telephone TEXT, email TEXT,
+          wilaya_residence TEXT, ville_naissance TEXT, wilaya_naissance TEXT,
           entreprise TEXT NOT NULL, secteur TEXT, adresse_entreprise TEXT,
           wilaya_entreprise TEXT, telephone_entreprise TEXT, email_entreprise TEXT,
           responsable TEXT, fonction_responsable TEXT, sujet_stage TEXT, domaine_stage TEXT,
+          enseignant_superviseur TEXT, programme_stage TEXT,
           date_debut TEXT, date_fin TEXT, observations TEXT,
           type_demande TEXT DEFAULT 'Stage rémunéré',
           participants_json TEXT DEFAULT '[]', statut TEXT DEFAULT 'Brouillon - formulaire à signer',
@@ -96,6 +126,8 @@ def init_db():
             "participants_json": "TEXT DEFAULT '[]'",
             "statut": "TEXT DEFAULT 'Brouillon - formulaire à signer'",
             "signed_pdf": "BLOB",
+            "wilaya_residence": "TEXT", "ville_naissance": "TEXT", "wilaya_naissance": "TEXT",
+            "enseignant_superviseur": "TEXT", "programme_stage": "TEXT",
         }
         for col, typ in migrations.items():
             if col not in cols: con.execute(f"ALTER TABLE demandes ADD COLUMN {col} {typ}")
@@ -107,6 +139,21 @@ def admin_password():
 
 def build_request_pdf(request_data, participants):
     """Génère le formulaire à imprimer et faire signer par l'établissement d'accueil."""
+    # Utilise une police Unicode pour que les noms arabes soient imprimables si disponible.
+    arabic_font = "Helvetica"
+    for font_path in [
+        APP_DIR / "DejaVuSans.ttf",
+        Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
+        Path("/usr/share/fonts/truetype/dejavu/DejaVuSansCondensed.ttf"),
+    ]:
+        if font_path.exists():
+            try:
+                if "FGEArabic" not in pdfmetrics.getRegisteredFontNames():
+                    pdfmetrics.registerFont(TTFont("FGEArabic", str(font_path)))
+                arabic_font = "FGEArabic"
+                break
+            except Exception:
+                pass
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(buffer, pagesize=A4, rightMargin=1.7*cm, leftMargin=1.7*cm,
                             topMargin=1.5*cm, bottomMargin=1.5*cm)
@@ -123,19 +170,38 @@ def build_request_pdf(request_data, participants):
         Spacer(1, 12),
         Paragraph("<b>Informations des étudiants demandeurs</b>", styles["Heading2"])
     ]
-    rows = [["N°", "Matricule", "Nom et prénom", "Promotion", "Groupe"]]
+    rows = [["N° / Matricule", "Information", "Détail", "Information", "Détail"]]
     for i, p in enumerate(participants, 1):
-        rows.append([str(i), p["matricule"], (p["nom"]+" "+p["prenom"]).strip(),
-                     p["promotion"], (p["groupe"]+" "+p["sous_groupe"]).strip()])
-    t = Table(rows, colWidths=[0.7*cm, 3.0*cm, 6.0*cm, 3.0*cm, 3.0*cm], repeatRows=1)
+        rows.extend([
+            [f"{i} / {p['matricule']}", "Nom et prénom", (p["nom"]+" "+p["prenom"]).strip(),
+             "Nom et prénom (arabe)", (p["nom_arabe"]+" "+p["prenom_arabe"]).strip()],
+            ["", "Promotion", p["promotion"], "Groupe / Sous-groupe",
+             (p["groupe"]+" / "+p["sous_groupe"]).strip()],
+            ["", "Wilaya de résidence", p["wilaya_residence"], "Ville de naissance", p["ville_naissance"]],
+            ["", "Wilaya de naissance", p["wilaya_naissance"], "Téléphone / E-mail",
+             (p["telephone"]+" / "+p["email"]).strip()]
+        ])
+    t = Table(rows, colWidths=[2.0*cm, 2.6*cm, 4.0*cm, 3.0*cm, 4.0*cm], repeatRows=1)
     t.setStyle(TableStyle([
         ("BACKGROUND",(0,0),(-1,0),colors.HexColor("#17466b")),
         ("TEXTCOLOR",(0,0),(-1,0),colors.white),("GRID",(0,0),(-1,-1),0.5,colors.grey),
-        ("FONTNAME",(0,0),(-1,0),"Helvetica-Bold"),("FONTSIZE",(0,0),(-1,-1),8),
-        ("VALIGN",(0,0),(-1,-1),"MIDDLE"),("ROWBACKGROUNDS",(0,1),(-1,-1),[colors.white,colors.HexColor("#edf3f8")]),
-        ("TOPPADDING",(0,0),(-1,-1),7),("BOTTOMPADDING",(0,0),(-1,-1),7)
+        ("FONTNAME",(0,0),(-1,0),"Helvetica-Bold"),("FONTNAME",(0,1),(-1,-1),arabic_font),
+        ("FONTSIZE",(0,0),(-1,-1),7),
+        ("VALIGN",(0,0),(-1,-1),"MIDDLE"),
+        ("BACKGROUND",(0,1),(0,-1),colors.HexColor("#edf3f8")),
+        ("BACKGROUND",(1,1),(1,-1),colors.HexColor("#edf3f8")),
+        ("BACKGROUND",(3,1),(3,-1),colors.HexColor("#edf3f8")),
+        ("TOPPADDING",(0,0),(-1,-1),5),("BOTTOMPADDING",(0,0),(-1,-1),5)
     ]))
-    story += [t, Spacer(1, 12), Paragraph("<b>Entreprise d'accueil</b>", styles["Heading2"])]
+    story += [t, Spacer(1, 12), Paragraph("<b>Encadrement du stage</b>", styles["Heading2"])]
+    supervisor_rows = [["Enseignant superviseur (Permanent)", request_data["superviseur"]],
+                       ["Programme détaillé du stage", request_data["programme"]]]
+    stbl = Table(supervisor_rows, colWidths=[4.5*cm, 11.0*cm])
+    stbl.setStyle(TableStyle([("GRID",(0,0),(-1,-1),0.4,colors.grey),
+        ("BACKGROUND",(0,0),(0,-1),colors.HexColor("#edf3f8")),
+        ("FONTSIZE",(0,0),(-1,-1),8),("VALIGN",(0,0),(-1,-1),"TOP"),
+        ("TOPPADDING",(0,0),(-1,-1),7),("BOTTOMPADDING",(0,0),(-1,-1),7)]))
+    story += [stbl, Spacer(1, 12), Paragraph("<b>Entreprise d'accueil</b>", styles["Heading2"])]
     fields = [
         ["Entreprise", request_data["entreprise"], "Secteur", request_data["secteur"]],
         ["Adresse", request_data["adresse"], "Wilaya / commune", request_data["wilaya"]],
@@ -174,6 +240,14 @@ try:
 except Exception as exc:
     st.error(f"Erreur de lecture du fichier Excel : {exc}")
     st.stop()
+try:
+    permanent_teachers = load_permanent_teachers(str(TEACHERS_FILE), TEACHERS_FILE.stat().st_mtime)
+except Exception as exc:
+    st.error(f"Erreur de lecture du fichier des enseignants permanents : {exc}")
+    st.stop()
+if not permanent_teachers:
+    st.error("Aucun enseignant Permanent trouvé dans le fichier des enseignants.")
+    st.stop()
 
 with st.sidebar:
     st.header("Navigation")
@@ -201,7 +275,10 @@ if page == "Demande de stage":
         with st.container(border=True):
             st.markdown("**Coordonnées du demandeur principal (issues du fichier source)**")
             st.write(f"**{main_student['nom']} {main_student['prenom']}** — {main_student['matricule']}")
+            st.write(f"Nom et prénom en arabe : {main_student['nom_arabe']} {main_student['prenom_arabe']}")
             st.write(f"Promotion : {main_student['promotion']} | Groupe : {main_student['groupe']} | Sous-groupe : {main_student['sous_groupe']}")
+            st.write(f"Wilaya de résidence : {main_student['wilaya_residence']} | Ville de naissance : {main_student['ville_naissance']}")
+            st.write(f"Wilaya de naissance : {main_student['wilaya_naissance']}")
             st.write(f"Téléphone : {main_student['telephone']} | E-mail : {main_student['email']}")
 
         st.markdown('<div class="section">2. Ajouter un ou plusieurs camarades</div>', unsafe_allow_html=True)
@@ -250,6 +327,12 @@ if page == "Demande de stage":
             fonction = c2.text_input("Fonction du responsable")
             sujet = st.text_input("Sujet / intitulé du stage *")
             domaine = st.text_input("Service ou domaine d'affectation")
+            superviseur = st.selectbox("Enseignant chargé de superviser le stage (Permanent uniquement) *",
+                                       options=permanent_teachers,
+                                       help="La liste est extraite du fichier des enseignants et filtrée sur la qualité Permanent.")
+            programme = st.text_area("Programme détaillé du stage *",
+                                     height=150,
+                                     placeholder="Décrivez les activités prévues, les travaux à réaliser et les objectifs du stage.")
             d1,d2 = st.columns(2)
             debut = d1.date_input("Date prévue de début", value=date.today())
             fin = d2.date_input("Date prévue de fin", value=date.today())
@@ -262,6 +345,9 @@ if page == "Demande de stage":
             if not entreprise.strip(): errors.append("Le nom de l'entreprise est obligatoire.")
             if not adresse.strip(): errors.append("L'adresse de l'entreprise est obligatoire.")
             if not sujet.strip(): errors.append("Le sujet du stage est obligatoire.")
+            if not programme.strip(): errors.append("Le programme détaillé du stage est obligatoire.")
+            if not superviseur.strip(): errors.append("Veuillez choisir un enseignant superviseur permanent.")
+            if superviseur not in permanent_teachers: errors.append("L'enseignant choisi doit être un Permanent.")
             if fin < debut: errors.append("La date de fin doit être postérieure ou égale à la date de début.")
             if errors:
                 for e in errors: st.error(e)
@@ -277,15 +363,17 @@ if page == "Demande de stage":
                     INSERT INTO demandes (date_soumission,matricule,nom,prenom,nom_arabe,prenom_arabe,
                     promotion,groupe,sous_groupe,telephone,email,entreprise,secteur,adresse_entreprise,
                     wilaya_entreprise,telephone_entreprise,email_entreprise,responsable,fonction_responsable,
-                    sujet_stage,domaine_stage,date_debut,date_fin,observations,type_demande,participants_json,statut)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    sujet_stage,domaine_stage,enseignant_superviseur,programme_stage,date_debut,date_fin,observations,
+                    wilaya_residence,ville_naissance,wilaya_naissance,type_demande,participants_json,statut)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                     """, (datetime.now().isoformat(timespec="seconds"),main_student["matricule"],
                     main_student["nom"],main_student["prenom"],main_student["nom_arabe"],main_student["prenom_arabe"],
                     main_student["promotion"],main_student["groupe"],main_student["sous_groupe"],
                     main_student["telephone"],main_student["email"],req["entreprise"],req["secteur"],req["adresse"],
                     req["wilaya"],req["tel_ent"],req["email_ent"],req["responsable"],req["fonction"],req["sujet"],
-                    req["domaine"],req["debut"],req["fin"],req["observations"],"Stage rémunéré",
-                    json.dumps(participants,ensure_ascii=False),"Brouillon - formulaire à signer"))
+                    req["domaine"],req["superviseur"],req["programme"],req["debut"],req["fin"],req["observations"],
+                    main_student["wilaya_residence"],main_student["ville_naissance"],main_student["wilaya_naissance"],
+                    "Stage rémunéré",json.dumps(participants,ensure_ascii=False),"Brouillon - formulaire à signer"))
                     rid = cur.lastrowid
                     con.commit()
                 st.session_state["active_request_id"] = rid
@@ -364,7 +452,8 @@ else:
         st.warning("Configurez ADMIN_PASSWORD dans les secrets Streamlit.")
     elif pwd and pwd == expected:
         with sqlite3.connect(DB_FILE) as con:
-            data = pd.read_sql_query("""SELECT id,date_soumission,matricule,nom,prenom,promotion,
+            data = pd.read_sql_query("""SELECT id,date_soumission,matricule,nom,prenom,nom_arabe,prenom_arabe,promotion,
+                wilaya_residence,ville_naissance,wilaya_naissance,enseignant_superviseur,programme_stage,
                 entreprise,sujet_stage,type_demande,statut,participants_json FROM demandes ORDER BY id DESC""",con)
         st.metric("Nombre total de demandes",len(data))
         if data.empty: st.info("Aucune demande enregistrée.")
@@ -372,7 +461,13 @@ else:
             def participants_label(raw):
                 try:
                     ps=json.loads(raw or "[]")
-                    return " ; ".join(f'{p.get("nom","")} {p.get("prenom","")} ({p.get("matricule","")})' for p in ps)
+                    return " ; ".join(
+                        f'{p.get("nom","")} {p.get("prenom","")} ({p.get("matricule","")})'
+                        f' | Arabe : {p.get("nom_arabe","")} {p.get("prenom_arabe","")}'
+                        f' | Wilaya résidence : {p.get("wilaya_residence","")}'
+                        f' | Ville naissance : {p.get("ville_naissance","")}'
+                        f' | Wilaya naissance : {p.get("wilaya_naissance","")}'
+                        for p in ps)
                 except Exception: return ""
             data["Étudiants participants"] = data["participants_json"].apply(participants_label)
             st.dataframe(data.drop(columns=["participants_json"]),use_container_width=True,hide_index=True)
