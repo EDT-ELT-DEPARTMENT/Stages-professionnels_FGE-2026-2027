@@ -3,6 +3,7 @@
 from pathlib import Path
 from datetime import date, datetime
 import os, re, sqlite3, json, io
+import html
 import pandas as pd
 import streamlit as st
 from reportlab.lib import colors
