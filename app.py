@@ -653,7 +653,7 @@ if page == "Demande de stage":
                             st.session_state.pop("active_pdf",None)
                             st.success(f"Demande STG-{active_id:05d} transmise au Chef de département.")
                             st.info("Le statut de votre demande est désormais : Transmise au Chef de département.")
-elif main_student:
+    elif main_student:
         st.markdown('<div class="section">2. Demande de visite en entreprise</div>', unsafe_allow_html=True)
         st.info("Votre promotion n'est pas éligible au stage rémunéré. Vous pouvez déposer une demande de visite en entreprise.")
         with st.form("visit_form"):
