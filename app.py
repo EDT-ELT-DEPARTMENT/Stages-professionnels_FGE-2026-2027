@@ -9,7 +9,7 @@ import streamlit as st
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.lib.enums import TA_CENTER
+from reportlab.lib.enums import TA_CENTER, TA_RIGHT
 from reportlab.lib.units import cm
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak
 from reportlab.pdfbase import pdfmetrics
@@ -80,6 +80,8 @@ def student_record(row):
         "matricule": first_value(row, "Mat. Etudiant"),
         "nom": first_value(row, "Nom"), "prenom": first_value(row, "Prénom"),
         "nom_arabe": first_value(row, "اللقب"), "prenom_arabe": first_value(row, "الإسم"),
+        "date_naissance": first_value(row, "Date de naiss.", "Date de naissance"),
+        "lieu_naissance": first_value(row, "Lieu de naissance", "Ville de naissance"),
         "wilaya_residence": first_value(row, "Wilaya de résidence"),
         "ville_naissance": first_value(row, "Ville de naissance"),
         "wilaya_naissance": first_value(row, "Wilaya de naissance", "Wilaya de naissance.1"),
@@ -112,6 +114,7 @@ def init_db():
           matricule TEXT NOT NULL, nom TEXT, prenom TEXT, nom_arabe TEXT, prenom_arabe TEXT,
           promotion TEXT, groupe TEXT, sous_groupe TEXT, telephone TEXT, email TEXT,
           wilaya_residence TEXT, ville_naissance TEXT, wilaya_naissance TEXT,
+          date_naissance TEXT, lieu_naissance TEXT,
           entreprise TEXT NOT NULL, secteur TEXT, adresse_entreprise TEXT,
           wilaya_entreprise TEXT, telephone_entreprise TEXT, email_entreprise TEXT,
           responsable TEXT, fonction_responsable TEXT, sujet_stage TEXT, domaine_stage TEXT,
@@ -128,6 +131,7 @@ def init_db():
             "statut": "TEXT DEFAULT 'Brouillon - formulaire à signer'",
             "signed_pdf": "BLOB",
             "wilaya_residence": "TEXT", "ville_naissance": "TEXT", "wilaya_naissance": "TEXT",
+            "date_naissance": "TEXT", "lieu_naissance": "TEXT",
             "enseignant_superviseur": "TEXT", "programme_stage": "TEXT",
         }
         for col, typ in migrations.items():
@@ -141,6 +145,19 @@ def admin_password():
 def build_request_pdf(request_data, participants):
     """Génère un PDF dont les cellules s'adaptent au contenu et passent sur plusieurs pages."""
     from reportlab.platypus import LongTable, KeepTogether
+
+    # Mise en forme arabe : ligatures + ordre droite-à-gauche si les dépendances sont installées.
+    try:
+        import arabic_reshaper
+        from bidi.algorithm import get_display
+        def arabic_display(value):
+            value = str(value or "")
+            if not re.search(r"[\u0600-\u06FF]", value):
+                return value
+            return get_display(arabic_reshaper.reshape(value))
+    except Exception:
+        def arabic_display(value):
+            return str(value or "")
 
     # Police Unicode si disponible (accents et caractères arabes).
     arabic_font = "Helvetica"
@@ -183,6 +200,10 @@ def build_request_pdf(request_data, participants):
         wordWrap="CJK", splitLongWords=1, spaceAfter=0, spaceBefore=0
     ))
     styles.add(ParagraphStyle(
+        name="ArabicCellFGE", parent=styles["CellFGE"], alignment=TA_RIGHT,
+        fontName=arabic_font
+    ))
+    styles.add(ParagraphStyle(
         name="LabelFGE", parent=styles["CellFGE"], fontName="Helvetica-Bold",
         textColor=colors.HexColor("#173f5f")
     ))
@@ -199,8 +220,11 @@ def build_request_pdf(request_data, participants):
         value = "" if value is None else str(value)
         if value.strip() == "":
             value = "—"
+        has_arabic = bool(re.search(r"[\u0600-\u06FF]", value))
+        value = arabic_display(value)
         # Évite qu'un &, < ou > présent dans les données casse le XML de Paragraph.
-        return Paragraph(html.escape(value).replace("\n", "<br/>"), styles[style])
+        selected_style = "ArabicCellFGE" if has_arabic and style == "CellFGE" else style
+        return Paragraph(html.escape(value).replace("\n", "<br/>"), styles[selected_style])
 
     def table_style(header=False, font_size=7.5):
         commands = [
@@ -243,11 +267,13 @@ def build_request_pdf(request_data, participants):
             [para(""), para("Promotion", "LabelFGE"), para(get("promotion")),
              para("Groupe / Sous-groupe", "LabelFGE"),
              para((get("groupe")+" / "+get("sous_groupe")).strip())],
+            [para(""), para("Date de naissance", "LabelFGE"), para(get("date_naissance")),
+             para("Lieu de naissance", "LabelFGE"), para(get("lieu_naissance"))],
             [para(""), para("Wilaya de résidence", "LabelFGE"), para(get("wilaya_residence")),
-             para("Ville de naissance", "LabelFGE"), para(get("ville_naissance"))],
-            [para(""), para("Wilaya de naissance", "LabelFGE"), para(get("wilaya_naissance")),
-             para("Téléphone / E-mail", "LabelFGE"),
-             para((get("telephone")+" / "+get("email")).strip())]
+             para("Wilaya de naissance", "LabelFGE"), para(get("wilaya_naissance"))],
+            [para(""), para("Téléphone / E-mail", "LabelFGE"),
+             para((get("telephone")+" / "+get("email")).strip()),
+             para("Ville de naissance", "LabelFGE"), para(get("ville_naissance"))]
         ])
     student_table = LongTable(rows, colWidths=student_widths, repeatRows=1, hAlign="LEFT")
     student_table.setStyle(table_style(header=True))
@@ -365,8 +391,8 @@ if page == "Demande de stage":
             st.write(f"**{main_student['nom']} {main_student['prenom']}** — {main_student['matricule']}")
             st.write(f"Nom et prénom en arabe : {main_student['nom_arabe']} {main_student['prenom_arabe']}")
             st.write(f"Promotion : {main_student['promotion']} | Groupe : {main_student['groupe']} | Sous-groupe : {main_student['sous_groupe']}")
-            st.write(f"Wilaya de résidence : {main_student['wilaya_residence']} | Ville de naissance : {main_student['ville_naissance']}")
-            st.write(f"Wilaya de naissance : {main_student['wilaya_naissance']}")
+            st.write(f"Date de naissance : {main_student['date_naissance']} | Lieu de naissance : {main_student['lieu_naissance']}")
+            st.write(f"Wilaya de résidence : {main_student['wilaya_residence']} | Wilaya de naissance : {main_student['wilaya_naissance']}")
             st.write(f"Téléphone : {main_student['telephone']} | E-mail : {main_student['email']}")
 
         st.markdown('<div class="section">2. Ajouter un ou plusieurs camarades</div>', unsafe_allow_html=True)
@@ -393,16 +419,42 @@ if page == "Demande de stage":
                 continue
             participants.append(record)
 
+        # Vérification et correction des données de chaque participant avant création du PDF.
+        st.markdown('<div class="section">3. Vérifier et corriger les informations des étudiants</div>', unsafe_allow_html=True)
+        st.info("Les données ci-dessous proviennent du fichier source. Vous pouvez les corriger avant la génération du PDF. Les corrections concernent uniquement cette demande.")
+        corrected_participants = []
+        for idx, original in enumerate(participants):
+            student = dict(original)
+            with st.expander(f"{idx + 1}. {original.get('nom','')} {original.get('prenom','')} — {original.get('matricule','')}", expanded=(idx == 0)):
+                a1, a2 = st.columns(2)
+                student["nom"] = a1.text_input("Nom", value=student.get("nom", ""), key=f"edit_nom_{idx}_{student.get('matricule','')}")
+                student["prenom"] = a2.text_input("Prénom", value=student.get("prenom", ""), key=f"edit_prenom_{idx}_{student.get('matricule','')}")
+                student["nom_arabe"] = a1.text_input("Nom en arabe (اللقب)", value=student.get("nom_arabe", ""), key=f"edit_nom_ar_{idx}_{student.get('matricule','')}")
+                student["prenom_arabe"] = a2.text_input("Prénom en arabe (الإسم)", value=student.get("prenom_arabe", ""), key=f"edit_prenom_ar_{idx}_{student.get('matricule','')}")
+                student["date_naissance"] = a1.text_input("Date de naissance", value=student.get("date_naissance", ""), key=f"edit_date_naiss_{idx}_{student.get('matricule','')}", placeholder="JJ/MM/AAAA")
+                student["lieu_naissance"] = a2.text_input("Lieu de naissance", value=student.get("lieu_naissance", ""), key=f"edit_lieu_naiss_{idx}_{student.get('matricule','')}")
+                student["wilaya_residence"] = a1.text_input("Wilaya de résidence", value=student.get("wilaya_residence", ""), key=f"edit_wilaya_res_{idx}_{student.get('matricule','')}")
+                student["wilaya_naissance"] = a2.text_input("Wilaya de naissance", value=student.get("wilaya_naissance", ""), key=f"edit_wilaya_naiss_{idx}_{student.get('matricule','')}")
+                student["ville_naissance"] = a1.text_input("Ville de naissance (source)", value=student.get("ville_naissance", ""), key=f"edit_ville_naiss_{idx}_{student.get('matricule','')}")
+                student["telephone"] = a2.text_input("Téléphone", value=student.get("telephone", ""), key=f"edit_tel_{idx}_{student.get('matricule','')}")
+                student["email"] = a1.text_input("E-mail", value=student.get("email", ""), key=f"edit_email_{idx}_{student.get('matricule','')}")
+            corrected_participants.append(student)
+        participants = corrected_participants
+        # Le demandeur principal enregistré dans les colonnes dédiées doit aussi refléter ses corrections.
+        main_student = participants[0]
+
         if companion_errors:
             for err in companion_errors: st.error(err)
         else:
             st.success(f"{len(participants)} étudiant(s) éligible(s) dans cette demande.")
         st.dataframe(pd.DataFrame([{
             "Matricule": p["matricule"], "Nom": p["nom"], "Prénom": p["prenom"],
+            "Nom arabe": p.get("nom_arabe", ""), "Prénom arabe": p.get("prenom_arabe", ""),
+            "Date de naissance": p.get("date_naissance", ""), "Lieu de naissance": p.get("lieu_naissance", ""),
             "Promotion": p["promotion"], "Groupe": p["groupe"], "Sous-groupe": p["sous_groupe"]
         } for p in participants]), use_container_width=True, hide_index=True)
 
-        st.markdown('<div class="section">3. Informations sur l’entreprise et le stage</div>', unsafe_allow_html=True)
+        st.markdown('<div class="section">4. Informations sur l’entreprise et le stage</div>', unsafe_allow_html=True)
         with st.form("stage_group_form"):
             c1,c2 = st.columns(2)
             entreprise = c1.text_input("Nom de l'entreprise *")
@@ -456,8 +508,8 @@ if page == "Demande de stage":
                     promotion,groupe,sous_groupe,telephone,email,entreprise,secteur,adresse_entreprise,
                     wilaya_entreprise,telephone_entreprise,email_entreprise,responsable,fonction_responsable,
                     sujet_stage,domaine_stage,enseignant_superviseur,programme_stage,date_debut,date_fin,observations,
-                    wilaya_residence,ville_naissance,wilaya_naissance,type_demande,participants_json,statut)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    wilaya_residence,ville_naissance,wilaya_naissance,date_naissance,lieu_naissance,type_demande,participants_json,statut)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                     """, (datetime.now().isoformat(timespec="seconds"),main_student["matricule"],
                     main_student["nom"],main_student["prenom"],main_student["nom_arabe"],main_student["prenom_arabe"],
                     main_student["promotion"],main_student["groupe"],main_student["sous_groupe"],
@@ -465,6 +517,7 @@ if page == "Demande de stage":
                     req["wilaya"],req["tel_ent"],req["email_ent"],req["responsable"],req["fonction"],req["sujet"],
                     req["domaine"],req["superviseur"],req["programme"],req["debut"],req["fin"],req["observations"],
                     main_student["wilaya_residence"],main_student["ville_naissance"],main_student["wilaya_naissance"],
+                    main_student["date_naissance"],main_student["lieu_naissance"],
                     "Stage rémunéré",json.dumps(participants,ensure_ascii=False),"Brouillon - formulaire à signer"))
                     rid = cur.lastrowid
                     con.commit()
@@ -475,7 +528,7 @@ if page == "Demande de stage":
         # Étape de téléchargement puis téléversement du formulaire signé.
         active_id = st.session_state.get("active_request_id")
         if active_id and st.session_state.get("active_pdf"):
-            st.markdown('<div class="section">4. Télécharger, faire signer et déposer le formulaire</div>', unsafe_allow_html=True)
+            st.markdown('<div class="section">5. Télécharger, faire signer et déposer le formulaire</div>', unsafe_allow_html=True)
             st.success(f"Formulaire généré — Référence STG-{active_id:05d}.")
             st.download_button("⬇️ Télécharger le formulaire PDF à imprimer et faire signer",
                                data=st.session_state["active_pdf"],
@@ -545,7 +598,7 @@ else:
     elif pwd and pwd == expected:
         with sqlite3.connect(DB_FILE) as con:
             data = pd.read_sql_query("""SELECT id,date_soumission,matricule,nom,prenom,nom_arabe,prenom_arabe,promotion,
-                wilaya_residence,ville_naissance,wilaya_naissance,enseignant_superviseur,programme_stage,
+                wilaya_residence,ville_naissance,wilaya_naissance,date_naissance,lieu_naissance,enseignant_superviseur,programme_stage,
                 entreprise,sujet_stage,type_demande,statut,participants_json FROM demandes ORDER BY id DESC""",con)
         st.metric("Nombre total de demandes",len(data))
         if data.empty: st.info("Aucune demande enregistrée.")
@@ -557,6 +610,8 @@ else:
                         f'{p.get("nom","")} {p.get("prenom","")} ({p.get("matricule","")})'
                         f' | Arabe : {p.get("nom_arabe","")} {p.get("prenom_arabe","")}'
                         f' | Wilaya résidence : {p.get("wilaya_residence","")}'
+                        f' | Date naissance : {p.get("date_naissance","")}'
+                        f' | Lieu naissance : {p.get("lieu_naissance","")}'
                         f' | Ville naissance : {p.get("ville_naissance","")}'
                         f' | Wilaya naissance : {p.get("wilaya_naissance","")}'
                         for p in ps)
