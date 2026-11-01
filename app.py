@@ -370,6 +370,72 @@ def build_three_stage_documents(request_data, student, nb_participants=1):
     doc.save(out)
     return out.getvalue()
 
+
+
+VISIT_TEMPLATE = APP_DIR / "Visite.docx"
+AVIS_CHEF_FAV = "Avis favorable"
+AVIS_CHEF_DEF = "Avis défavorable"
+
+def _replace_docx_text_in_paragraph(paragraph, replacements):
+    original = paragraph.text
+    updated = original
+    for old, new in replacements.items():
+        updated = updated.replace(old, str(new or ""))
+    if updated != original:
+        if paragraph.runs:
+            paragraph.runs[0].text = updated
+            for run in paragraph.runs[1:]:
+                run.text = ""
+        else:
+            paragraph.text = updated
+
+def _walk_docx_paragraphs(container):
+    for paragraph in getattr(container, "paragraphs", []):
+        yield paragraph
+    for table in getattr(container, "tables", []):
+        for row in table.rows:
+            for cell in row.cells:
+                yield from _walk_docx_paragraphs(cell)
+
+def build_visit_document(data):
+    """Remplit le modèle institutionnel Visite.docx avec les données saisies par le candidat."""
+    if not VISIT_TEMPLATE.is_file():
+        raise FileNotFoundError(
+            "Le modèle Visite.docx est introuvable. Placez Visite.docx dans le même dossier que app.py."
+        )
+    doc = Document(str(VISIT_TEMPLATE))
+    replacements = {
+        "«Date_de_demande_de_stage_»": data.get("date_generation", ""),
+        "«Dénomination_de_lentreprise»": data.get("entreprise", ""),
+        "«Wilaya_de_lentreprise»": data.get("wilaya_entreprise", ""),
+        "«Nom_»": data.get("nom", ""),
+        "«Prénom»": data.get("prenom", ""),
+        "«Date_de_Naissance»": data.get("date_naissance", ""),
+        "«Lieu_de_Naissance»": data.get("lieu_naissance", ""),
+        "«Niveau»": data.get("niveau", ""),
+        "«Diplome_Préparé»": data.get("diplome_prepare", ""),
+        "«Spécialité»": data.get("specialite", ""),
+        "«Date_de_début_de_Stage»": data.get("date_debut", ""),
+        "«Date_de_fin_de_Stage_»": data.get("date_fin", ""),
+    }
+    # Corps, tableaux, en-têtes et pieds de page.
+    for paragraph in _walk_docx_paragraphs(doc):
+        _replace_docx_text_in_paragraph(paragraph, replacements)
+    for section in doc.sections:
+        for part in (section.header, section.footer):
+            for paragraph in _walk_docx_paragraphs(part):
+                _replace_docx_text_in_paragraph(paragraph, replacements)
+    output = io.BytesIO()
+    doc.save(output)
+    return output.getvalue()
+
+def date_fr_visit(value):
+    try:
+        return datetime.strptime(str(value), "%Y-%m-%d").strftime("%d/%m/%Y")
+    except Exception:
+        return str(value or "")
+
+
 def init_db():
     with sqlite3.connect(DB_FILE) as con:
         con.execute("""
@@ -401,6 +467,9 @@ def init_db():
             "date_naissance": "TEXT", "lieu_naissance": "TEXT",
             "adresse_domicile": "TEXT", "ccp_number": "TEXT", "cheque_barre": "BLOB",
             "enseignant_superviseur": "TEXT", "programme_stage": "TEXT",
+            "niveau": "TEXT", "diplome_prepare": "TEXT", "specialite": "TEXT",
+            "visite_docx": "BLOB", "visite_date_generation": "TEXT",
+            "chef_avis": "TEXT", "chef_avis_date": "TEXT", "chef_observation": "TEXT",
             # Masquage de l'affichage historique sans supprimer les décisions validées.
             "historique_efface": "INTEGER DEFAULT 0",
         }
@@ -546,6 +615,43 @@ def refresh_request_status(con, rid):
         return
     con.execute("UPDATE demandes SET statut=?, vice_dean_avis=? WHERE id=?", (statut, avis, rid))
 
+def reference_demande(demande_id, type_demande="Stage rémunéré"):
+    """Référence lisible : STG pour un stage, VIS pour une visite."""
+    prefix = "VIS" if str(type_demande or "").strip().lower() in {"visite en entreprise", "visite"} else "STG"
+    return f"{prefix}-{int(demande_id):05d}"
+
+
+def visites_export_df(con):
+    """Export administratif détaillé : une ligne par demande de visite."""
+    rows = con.execute("""SELECT id,date_soumission,departement,matricule,nom,prenom,nom_arabe,prenom_arabe,
+        promotion,niveau,diplome_prepare,specialite,date_naissance,lieu_naissance,telephone,email,
+        entreprise,wilaya_entreprise,date_debut,date_fin,statut,chef_avis,chef_avis_date,chef_observation,
+        visite_date_generation,visite_docx IS NOT NULL
+        FROM demandes WHERE type_demande='Visite en entreprise' ORDER BY id DESC""").fetchall()
+    columns = ["id","date_soumission","departement","matricule","nom","prenom","nom_arabe","prenom_arabe",
+        "promotion","niveau","diplome_prepare","specialite","date_naissance","lieu_naissance","telephone","email",
+        "entreprise","wilaya_entreprise","date_debut","date_fin","statut","chef_avis","chef_avis_date",
+        "chef_observation","visite_date_generation","document_genere"]
+    df = pd.DataFrame(rows, columns=columns)
+    if df.empty:
+        return pd.DataFrame(columns=["Référence", "Date de dépôt", "Matricule", "Nom", "Prénom", "Promotion",
+            "Niveau", "Diplôme préparé", "Spécialité", "Date de naissance", "Lieu de naissance", "Téléphone",
+            "E-mail", "Entreprise", "Wilaya de l'entreprise", "Début de visite", "Fin de visite", "Statut",
+            "Avis du Chef de département", "Date de décision", "Observation du Chef", "Document Visite.docx généré le",
+            "Document Word disponible"])
+    df.insert(0, "Référence", df["id"].apply(lambda x: reference_demande(x, "Visite en entreprise")))
+    df = df.rename(columns={"date_soumission":"Date de dépôt", "matricule":"Matricule", "nom":"Nom", "prenom":"Prénom",
+        "nom_arabe":"Nom (arabe)", "prenom_arabe":"Prénom (arabe)", "promotion":"Promotion", "niveau":"Niveau",
+        "diplome_prepare":"Diplôme préparé", "specialite":"Spécialité", "date_naissance":"Date de naissance",
+        "lieu_naissance":"Lieu de naissance", "telephone":"Téléphone", "email":"E-mail", "entreprise":"Entreprise",
+        "wilaya_entreprise":"Wilaya de l'entreprise", "date_debut":"Début de visite", "date_fin":"Fin de visite",
+        "statut":"Statut", "chef_avis":"Avis du Chef de département", "chef_avis_date":"Date de décision",
+        "chef_observation":"Observation du Chef", "visite_date_generation":"Document Visite.docx généré le",
+        "document_genere":"Document Word disponible"})
+    df["Document Word disponible"] = df["Document Word disponible"].map(lambda v: "Oui" if bool(v) else "Non")
+    return df.drop(columns=["id", "departement"], errors="ignore")
+
+
 def dossiers_export_df(con, where="", params=(), include_ccp=True):
     """Une ligne par étudiant : sa demande et l'avis du Vice-doyen le concernant."""
     sql = """SELECT r.id, d.matricule, d.nom, d.prenom, COALESCE(NULLIF(d.promotion, ''), r.promotion),
@@ -562,7 +668,7 @@ def dossiers_export_df(con, where="", params=(), include_ccp=True):
         avis = (r[15] or "").strip()
         if not avis:
             avis = "En attente de l'avis du Vice-doyen" if r[13] else "Dossier pas encore transmis au Vice-doyen"
-        row = {"Référence": f"STG-{int(r[0]):05d}", "Matricule": r[1], "Nom": r[2], "Prénom": r[3], "Promotion": r[4]}
+        row = {"Référence": reference_demande(r[0], "Stage rémunéré"), "Matricule": r[1], "Nom": r[2], "Prénom": r[3], "Promotion": r[4]}
         if include_ccp:
             row["N° CCP"] = r[5] or ""
         row.update({"Entreprise": r[6], "Sujet du stage": r[7], "Enseignant superviseur": r[8],
@@ -613,7 +719,7 @@ def demandeurs_situation_df(con):
         else:
             situation, etape = "En instance", "Chez le Chef de département (documents à générer)"
         role = "Demandeur principal" if normalize_matricule(r[1]) == normalize_matricule(r[2]) else "Binôme"
-        out.append({"Situation": situation, "Étape": etape, "Référence": f"STG-{int(r[0]):05d}", "Rôle": role,
+        out.append({"Situation": situation, "Étape": etape, "Référence": reference_demande(r[0], "Stage rémunéré"), "Rôle": role,
                     "Matricule": r[2], "Nom": r[3], "Prénom": r[4], "Promotion": r[5], "N° CCP": r[6] or "",
                     "Entreprise": r[7], "Sujet du stage": r[8], "Enseignant superviseur": r[9],
                     "Début": r[10], "Fin": r[11], "Date de soumission": r[12],
@@ -970,7 +1076,8 @@ if page == "Demande de stage":
                     "AND signed_pdf IS NULL LIMIT 1", (matricule_key,)
                 ).fetchone() is not None
 
-            if favorable_previous_requests and not reapply_authorized and not open_pending:
+            if (norm_promo(main_student["promotion"]) in PROMOTIONS_STAGE_REMUNERE
+                    and favorable_previous_requests and not reapply_authorized and not open_pending):
                 previous = favorable_previous_requests[0]
                 st.error(
                     "⛔ Un avis favorable a déjà été accordé pour ce matricule. "
@@ -991,7 +1098,8 @@ if page == "Demande de stage":
                     "par l'administration, veuillez contacter le service responsable."
                 )
                 st.stop()
-            elif favorable_previous_requests and reapply_authorized:
+            elif (norm_promo(main_student["promotion"]) in PROMOTIONS_STAGE_REMUNERE
+                    and favorable_previous_requests and reapply_authorized):
                 previous = favorable_previous_requests[0]
                 st.warning(
                     "⚠️ Mention administrative : vous avez déjà obtenu un avis favorable "
@@ -1002,13 +1110,12 @@ if page == "Demande de stage":
                            f"{previous.get('vice_dean_date') or 'date non renseignée'}.")
 
             if norm_promo(main_student["promotion"]) not in PROMOTIONS_STAGE_REMUNERE:
-                st.warning(f"Votre promotion ({main_student['promotion']}) n'est pas éligible au stage rémunéré. Vous êtes orienté(e) vers la visite en entreprise.")
-                st.info("La demande groupée de stage rémunéré est réservée aux promotions autorisées. Pour une visite, utilisez la procédure correspondante.")
-                st.stop()
-            st.success(f"Étudiant reconnu : {main_student['nom']} {main_student['prenom']} — {main_student['promotion']}")
+                st.warning(f"Votre promotion ({main_student['promotion']}) n'est pas éligible au stage rémunéré. Vous êtes automatiquement orienté(e) vers la visite en entreprise.")
+            else:
+                st.success(f"Étudiant reconnu : {main_student['nom']} {main_student['prenom']} — {main_student['promotion']}")
 
     pending_request = None
-    if main_student:
+    if main_student and norm_promo(main_student["promotion"]) in PROMOTIONS_STAGE_REMUNERE:
         # Reprendre la dernière demande envoyée mais dont le document signé manque.
         with sqlite3.connect(DB_FILE) as con:
             row_pending = con.execute(
@@ -1262,7 +1369,7 @@ if page == "Demande de stage":
         active_id = st.session_state.get("active_request_id")
         if active_id and st.session_state.get("active_pdf"):
             st.markdown('<div class="section">5. Télécharger, faire signer et déposer le formulaire</div>', unsafe_allow_html=True)
-            st.success(f"Formulaire généré — Référence STG-{active_id:05d}.")
+            st.success(f"Formulaire généré — Référence {reference_demande(active_id, "Stage rémunéré")}.")
             st.download_button("⬇️ Télécharger le formulaire PDF à imprimer et faire signer",
                                data=st.session_state["active_pdf"],
                                file_name=f"Demande_stage_FGE_STG-{active_id:05d}.pdf",
@@ -1289,38 +1396,84 @@ if page == "Demande de stage":
                             st.info("Le statut de votre demande est désormais : Transmise au Chef de département.")
     elif main_student:
         st.markdown('<div class="section">2. Demande de visite en entreprise</div>', unsafe_allow_html=True)
-        st.info("Votre promotion n'est pas éligible au stage rémunéré. Vous pouvez déposer une demande de visite en entreprise.")
+        st.info("Votre promotion n'appartient pas aux promotions autorisées au stage rémunéré. Votre demande est donc traitée comme une visite en entreprise. Le document officiel Visite.docx sera généré automatiquement dès l'envoi.")
         with st.form("visit_form"):
-            v1, v2 = st.columns(2)
-            v_ent = v1.text_input("Nom de l'entreprise *")
-            v_sector = v2.text_input("Secteur d'activité")
-            v_address = v1.text_area("Adresse complète *")
-            v_wilaya = v2.text_input("Wilaya / commune")
-            v_tel = v1.text_input("Téléphone")
-            v_email = v2.text_input("E-mail")
-            v_responsable = v1.text_input("Responsable d'accueil")
-            v_sujet = v2.text_input("Objet de la visite *")
-            v_date = st.date_input("Date souhaitée", value=date.today())
-            v_submit = st.form_submit_button("Envoyer la demande de visite", use_container_width=True)
+            st.markdown("**Vérification et renseignements personnels du candidat**")
+            vc1, vc2 = st.columns(2)
+            v_nom = vc1.text_input("Nom *", value=main_student.get("nom", ""))
+            v_prenom = vc2.text_input("Prénom *", value=main_student.get("prenom", ""))
+            v_birth = vc1.text_input("Date de naissance *", value=main_student.get("date_naissance", ""), placeholder="JJ/MM/AAAA")
+            v_birth_place = vc2.text_input("Lieu de naissance *", value=main_student.get("lieu_naissance", ""))
+            v_niveau = vc1.text_input("Niveau *", value=main_student.get("promotion", ""))
+            v_diploma = vc2.text_input("Diplôme préparé *", value="Licence" if norm_promo(main_student.get("promotion","")).startswith(("L","MCIL")) else "Master / Ingénieur")
+            v_speciality = st.text_input("Spécialité *", value="Électrotechnique" if "ELT" in norm_promo(main_student.get("promotion","")) or "MCIL" in norm_promo(main_student.get("promotion","")) else "")
+            st.markdown("**Entreprise d'accueil et période de visite**")
+            ve1, ve2 = st.columns(2)
+            v_ent = ve1.text_input("Dénomination de l'entreprise *")
+            v_wilaya = ve2.text_input("Wilaya de l'entreprise *")
+            vd1, vd2 = st.columns(2)
+            v_start = vd1.date_input("Date de début de la visite *", value=date.today())
+            v_end = vd2.date_input("Date de fin de la visite *", value=date.today() + timedelta(days=1))
+            v_submit = st.form_submit_button("📨 Envoyer la demande et générer Visite.docx", use_container_width=True)
         if v_submit:
-            if not v_ent.strip() or not v_address.strip() or not v_sujet.strip():
-                st.error("Veuillez renseigner l'entreprise, l'adresse et l'objet de la visite.")
+            errors = []
+            for label, value in [
+                ("Nom", v_nom), ("Prénom", v_prenom), ("Date de naissance", v_birth),
+                ("Lieu de naissance", v_birth_place), ("Niveau", v_niveau),
+                ("Diplôme préparé", v_diploma), ("Spécialité", v_speciality),
+                ("Dénomination de l'entreprise", v_ent), ("Wilaya de l'entreprise", v_wilaya)
+            ]:
+                if not str(value or "").strip():
+                    errors.append(f"Le champ « {label} » est obligatoire.")
+            if v_end < v_start:
+                errors.append("La date de fin doit être postérieure ou égale à la date de début.")
+            if errors:
+                for error in errors:
+                    st.error(error)
             else:
-                with sqlite3.connect(DB_FILE) as con:
-                    cur = con.execute("""INSERT INTO demandes
-                    (date_soumission,matricule,nom,prenom,nom_arabe,prenom_arabe,promotion,groupe,sous_groupe,
-                     telephone,email,entreprise,secteur,adresse_entreprise,wilaya_entreprise,telephone_entreprise,
-                     email_entreprise,responsable,sujet_stage,date_debut,date_fin,type_demande,participants_json,statut)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                    (datetime.now().isoformat(timespec="seconds"),main_student["matricule"],main_student["nom"],
-                     main_student["prenom"],main_student["nom_arabe"],main_student["prenom_arabe"],main_student["promotion"],
-                     main_student["groupe"],main_student["sous_groupe"],main_student["telephone"],main_student["email"],
-                     v_ent.strip(),v_sector.strip(),v_address.strip(),v_wilaya.strip(),v_tel.strip(),v_email.strip(),
-                     v_responsable.strip(),v_sujet.strip(),v_date.isoformat(),v_date.isoformat(),
-                     "Visite en entreprise",json.dumps([main_student],ensure_ascii=False),"Demande de visite reçue"))
-                    visit_id=cur.lastrowid
-                    con.commit()
-                st.success(f"Votre demande de visite a été enregistrée. Référence : VIS-{visit_id:05d}.")
+                generation_dt = datetime.now()
+                visit_data = {
+                    "nom": v_nom.strip(), "prenom": v_prenom.strip(),
+                    "date_naissance": v_birth.strip(), "lieu_naissance": v_birth_place.strip(),
+                    "niveau": v_niveau.strip(), "diplome_prepare": v_diploma.strip(),
+                    "specialite": v_speciality.strip(), "entreprise": v_ent.strip(),
+                    "wilaya_entreprise": v_wilaya.strip(),
+                    "date_debut": v_start.strftime("%d/%m/%Y"),
+                    "date_fin": v_end.strftime("%d/%m/%Y"),
+                    "date_generation": generation_dt.strftime("%d/%m/%Y"),
+                }
+                try:
+                    visit_docx = build_visit_document(visit_data)
+                except Exception as exc:
+                    st.error(f"Impossible de générer le document Visite.docx : {exc}")
+                else:
+                    with sqlite3.connect(DB_FILE) as con:
+                        cur = con.execute("""INSERT INTO demandes
+                            (date_soumission,matricule,nom,prenom,promotion,date_naissance,lieu_naissance,
+                             entreprise,wilaya_entreprise,date_debut,date_fin,type_demande,participants_json,
+                             statut,niveau,diplome_prepare,specialite,visite_docx,visite_date_generation)
+                            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                            (generation_dt.isoformat(timespec="seconds"), main_student["matricule"],
+                             visit_data["nom"], visit_data["prenom"], main_student["promotion"],
+                             visit_data["date_naissance"], visit_data["lieu_naissance"], visit_data["entreprise"],
+                             visit_data["wilaya_entreprise"], v_start.isoformat(), v_end.isoformat(),
+                             "Visite en entreprise", json.dumps([main_student], ensure_ascii=False),
+                             "Demande de visite transmise au Chef de département",
+                             visit_data["niveau"], visit_data["diplome_prepare"], visit_data["specialite"],
+                             sqlite3.Binary(visit_docx), generation_dt.isoformat(timespec="minutes")))
+                        visit_id = cur.lastrowid
+                        con.commit()
+                    st.session_state["last_visit_id"] = int(visit_id)
+                    st.session_state["last_visit_docx"] = visit_docx
+                    st.success(f"Votre demande de visite a été envoyée au Chef de département. Référence : VIS-{visit_id:05d}.")
+        if st.session_state.get("last_visit_id") and st.session_state.get("last_visit_docx"):
+            visit_id = int(st.session_state["last_visit_id"])
+            st.download_button("⬇️ Télécharger le document officiel Visite.docx (déjà renseigné)",
+                data=st.session_state["last_visit_docx"],
+                file_name=f"Visite_FGE_VIS-{visit_id:05d}.docx",
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                use_container_width=True)
+            st.caption("Date de génération automatiquement inscrite dans le document. La demande est en attente de l'avis du Chef de département.")
 
 elif page == "Administration":
     st.title("Administration — Suivi des demandes")
@@ -1478,6 +1631,8 @@ elif page == "Administration":
                         f' | Wilaya naissance : {p.get("wilaya_naissance","")}'
                         for p in ps)
                 except Exception: return ""
+            data["Référence"] = data.apply(
+                lambda rec: reference_demande(rec["id"], rec.get("type_demande", "Stage rémunéré")), axis=1)
             data["Étudiants participants"] = data["participants_json"].apply(participants_label)
             st.dataframe(data.drop(columns=["participants_json"]),use_container_width=True,hide_index=True)
             csv=data.drop(columns=["participants_json"]).to_csv(index=False).encode("utf-8-sig")
@@ -1485,12 +1640,14 @@ elif page == "Administration":
             # Export Excel multi-feuilles : demandes principales + détail des participants.
             xlsx_buffer = io.BytesIO()
             export_data = data.drop(columns=["participants_json"]).copy()
+            export_data.insert(0, "Référence", export_data.apply(
+                lambda rec: reference_demande(rec["id"], rec.get("type_demande", "Stage rémunéré")), axis=1))
             participant_rows = []
             for _, rec in data.iterrows():
                 try: plist = json.loads(rec.get("participants_json") or "[]")
                 except Exception: plist = []
                 for part in plist:
-                    participant_rows.append({"Référence": f"STG-{int(rec['id']):05d}", "Matricule demandeur": rec.get("matricule", ""),
+                    participant_rows.append({"Référence": reference_demande(rec["id"], rec.get("type_demande", "Stage rémunéré")), "Matricule demandeur": rec.get("matricule", ""),
                         "Matricule participant": part.get("matricule", ""), "Nom": part.get("nom", ""),
                         "Prénom": part.get("prenom", ""), "Nom arabe": part.get("nom_arabe", ""),
                         "Prénom arabe": part.get("prenom_arabe", ""), "Promotion": part.get("promotion", ""),
@@ -1508,14 +1665,16 @@ elif page == "Administration":
                 st.download_button("📊 Excel — demandes par étudiant et leur avis", df_to_excel_bytes(all_df),
                                    "Demandes_et_avis_FGE_2026-2027.xlsx", XLSX_MIME, key="admin_excel_avis")
             st.markdown("### Consulter le formulaire signé")
-            selected=st.selectbox("Référence de demande",options=data["id"].tolist(),
-                                  format_func=lambda x:f"STG-{x:05d}")
+            stage_data = data[data["type_demande"].fillna("Stage rémunéré") == "Stage rémunéré"]
+            st.markdown("### Consulter le formulaire signé d'un stage")
+            selected=st.selectbox("Référence de demande de stage",options=stage_data["id"].tolist(),
+                                  format_func=lambda x:reference_demande(x, "Stage rémunéré"))
             with sqlite3.connect(DB_FILE) as con:
                 row=con.execute("SELECT signed_pdf,statut FROM demandes WHERE id=?",(selected,)).fetchone()
             if row and row[0]:
                 st.success(f"Statut : {row[1]}")
                 st.download_button("⬇️ Télécharger le formulaire signé",data=bytes(row[0]),
-                                   file_name=f"Demande_signee_STG-{selected:05d}.pdf",mime="application/pdf")
+                                   file_name=f"Demande_signee_{reference_demande(selected, 'Stage rémunéré')}.pdf",mime="application/pdf")
             elif row:
                 st.warning(f"Statut : {row[1]} — le document signé n'a pas encore été déposé.")
     elif pwd: st.error("Mot de passe incorrect.")
@@ -1626,6 +1785,78 @@ elif page == "Chef de département":
                             st.info("En attente de l'avis du Vice-doyen pour cet étudiant.")
             else:
                 st.warning("Le formulaire signé par l'étudiant n'est pas encore disponible.")
+        st.divider()
+        st.markdown("### 🏢 Demandes de visite en entreprise — décision du Chef de département uniquement")
+        with sqlite3.connect(DB_FILE) as con:
+            visit_df = pd.read_sql_query("""SELECT id,date_soumission,matricule,nom,prenom,promotion,
+                niveau,diplome_prepare,specialite,date_naissance,lieu_naissance,telephone,email,
+                entreprise,wilaya_entreprise,date_debut,date_fin,statut,chef_avis,chef_avis_date,
+                chef_observation,visite_date_generation,visite_docx IS NOT NULL AS document_genere
+                FROM demandes WHERE type_demande='Visite en entreprise' ORDER BY id DESC""", con)
+            visit_export_df = visites_export_df(con)
+        st.caption("Suivi séparé des demandes de visite : références VIS-xxxxx, distinctes des dossiers de stage STG-xxxxx.")
+        st.metric("Nombre de demandes de visite", int(len(visit_df)))
+        if visit_df.empty:
+            st.info("Aucune demande de visite enregistrée.")
+        else:
+            visit_display = visit_export_df.copy()
+            st.dataframe(visit_display, use_container_width=True, hide_index=True)
+            st.download_button("📊 Télécharger le tableau détaillé des visites (Excel)",
+                data=df_to_excel_bytes(visit_display, "Demandes de visite"),
+                file_name="Demandes_visites_entreprise_FGE_2026-2027.xlsx", mime=XLSX_MIME,
+                key="admin_excel_visites")
+            visit_ids = visit_df["id"].astype(int).tolist()
+            selected_visit = st.selectbox(
+                "Choisir une demande de visite",
+                visit_ids,
+                format_func=lambda x: (
+                    f"{reference_demande(x, 'Visite en entreprise')} — " +
+                    str(visit_df.loc[visit_df.id == x, "nom"].iloc[0]) + " " +
+                    str(visit_df.loc[visit_df.id == x, "prenom"].iloc[0]) + " — " +
+                    str(visit_df.loc[visit_df.id == x, "entreprise"].iloc[0])
+                ),
+                key="chef_selected_visit"
+            )
+            with sqlite3.connect(DB_FILE) as con:
+                con.row_factory = sqlite3.Row
+                selected_visit_row = con.execute("SELECT * FROM demandes WHERE id=? AND type_demande='Visite en entreprise'",
+                                                  (selected_visit,)).fetchone()
+                selected_visit_row = dict(selected_visit_row) if selected_visit_row else {}
+            if selected_visit_row:
+                st.write(f"**Candidat :** {selected_visit_row.get('nom','')} {selected_visit_row.get('prenom','')} — {selected_visit_row.get('matricule','')}")
+                st.write(f"**Promotion :** {selected_visit_row.get('promotion','')} | **Entreprise :** {selected_visit_row.get('entreprise','')} ({selected_visit_row.get('wilaya_entreprise','')})")
+                if selected_visit_row.get("visite_docx"):
+                    st.download_button("Télécharger / consulter Visite.docx",
+                        bytes(selected_visit_row["visite_docx"]),
+                        f"Visite_FGE_VIS-{int(selected_visit):05d}.docx",
+                        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                        key=f"chef_visit_doc_{selected_visit}")
+                    st.caption(f"Document généré le : {selected_visit_row.get('visite_date_generation') or '—'}")
+                avis_chef_actuel = (selected_visit_row.get("chef_avis") or "").strip()
+                if avis_chef_actuel == AVIS_CHEF_FAV:
+                    st.success(f"Avis favorable du Chef de département déjà accordé le {selected_visit_row.get('chef_avis_date') or '—'}.")
+                elif avis_chef_actuel == AVIS_CHEF_DEF:
+                    st.error(f"Avis défavorable du Chef de département rendu le {selected_visit_row.get('chef_avis_date') or '—'}.")
+                observation_chef = st.text_area("Observation du Chef de département",
+                    value=selected_visit_row.get("chef_observation") or "",
+                    key=f"chef_visit_comment_{selected_visit}")
+                ca1, ca2 = st.columns(2)
+                chef_fav = ca1.button("✅ Accorder l'avis favorable", type="primary",
+                    key=f"chef_visit_fav_{selected_visit}", use_container_width=True)
+                chef_def = ca2.button("❌ Rendre un avis défavorable",
+                    key=f"chef_visit_def_{selected_visit}", use_container_width=True)
+                if chef_fav or chef_def:
+                    new_chef_avis = AVIS_CHEF_FAV if chef_fav else AVIS_CHEF_DEF
+                    with sqlite3.connect(DB_FILE) as con:
+                        con.execute("""UPDATE demandes SET chef_avis=?, chef_avis_date=?, chef_observation=?, statut=?
+                            WHERE id=? AND type_demande='Visite en entreprise'""",
+                            (new_chef_avis, datetime.now().isoformat(timespec="minutes"),
+                             observation_chef.strip(),
+                             "Avis favorable du Chef de département" if chef_fav else "Avis défavorable du Chef de département",
+                             selected_visit))
+                        con.commit()
+                    st.success("Décision du Chef de département enregistrée. Aucun avis du Vice-doyen n'est requis pour une visite.")
+                    st.rerun()
     elif pwd_chef:
         st.error("Mot de passe incorrect.")
 
