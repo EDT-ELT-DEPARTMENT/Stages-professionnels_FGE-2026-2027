@@ -697,6 +697,24 @@ def visites_export_df(con):
             "E-mail", "Entreprise", "Wilaya de l'entreprise", "Début de visite", "Fin de visite", "Statut",
             "Avis du Chef de département", "Date de décision", "Observation du Chef", "Document Visite.docx généré le",
             "Document Word disponible"])
+    # Les noms arabes sont récupérés directement depuis le fichier officiel des étudiants,
+    # et non depuis les champs arabes éventuellement vides de la base des demandes.
+    # La correspondance se fait par matricule étudiant.
+    source_students = globals().get("students")
+    if isinstance(source_students, pd.DataFrame) and not source_students.empty:
+        source_df = source_students.copy()
+        if "_matricule_key" not in source_df.columns and "Mat. Etudiant" in source_df.columns:
+            source_df["_matricule_key"] = source_df["Mat. Etudiant"].apply(normalize_matricule)
+        if "_matricule_key" in source_df.columns:
+            source_df = source_df.drop_duplicates("_matricule_key", keep="first").set_index("_matricule_key")
+            def _source_arabe(matricule, colonne):
+                cle = normalize_matricule(matricule)
+                if not cle or cle not in source_df.index or colonne not in source_df.columns:
+                    return ""
+                return clean_text(source_df.at[cle, colonne])
+            df["nom_arabe"] = df["matricule"].map(lambda m: _source_arabe(m, "اللقب"))
+            df["prenom_arabe"] = df["matricule"].map(lambda m: _source_arabe(m, "الإسم"))
+
     df.insert(0, "Référence", df["id"].apply(lambda x: reference_demande(x, "Visite en entreprise")))
     df = df.rename(columns={"date_soumission":"Date de dépôt", "matricule":"Matricule", "nom":"Nom", "prenom":"Prénom",
         "nom_arabe":"Nom (arabe)", "prenom_arabe":"Prénom (arabe)", "promotion":"Promotion", "niveau":"Niveau",
