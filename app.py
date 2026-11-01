@@ -6,6 +6,7 @@ import os, re, sqlite3, json, io
 import html
 import base64, zlib, tempfile
 from docx import Document
+from docx.shared import Pt, RGBColor
 import pandas as pd
 import streamlit as st
 from reportlab.lib import colors
@@ -368,6 +369,28 @@ def build_three_stage_documents(request_data, student, nb_participants=1):
     walk_paragraphs(doc)
     fix_stage_passage(doc, full_name, promotion)
     fix_attestation_inscription(doc, promotion)
+
+    # Identifier explicitement la nature du stage dans le dossier documentaire
+    # généré par le Chef de département (un fichier regroupant les formulaires).
+    if str(r.get("type_demande", "Stage rémunéré")).strip() == "Stage non rémunéré":
+        title = "DEMANDE DE STAGE PROFESSIONNEL NON RÉMUNÉRÉ"
+        anchor = next((p for p in doc.paragraphs
+                       if "Attestation d’Assiduité" in p.text or "Attestation d'Assiduité" in p.text), None)
+        if anchor is not None:
+            title_paragraph = anchor.insert_paragraph_before(title)
+            title_paragraph.alignment = 1  # centré
+            for run in title_paragraph.runs:
+                run.bold = True
+                run.font.size = Pt(14)
+                run.font.color.rgb = RGBColor(23, 63, 95)
+        else:
+            title_paragraph = doc.paragraphs[0].insert_paragraph_before(title)
+            title_paragraph.alignment = 1
+            for run in title_paragraph.runs:
+                run.bold = True
+                run.font.size = Pt(14)
+                run.font.color.rgb = RGBColor(23, 63, 95)
+
     out = io.BytesIO()
     doc.save(out)
     return out.getvalue()
@@ -873,9 +896,13 @@ def build_request_pdf(request_data, participants):
         ("LEFTPADDING", (0,0), (-1,-1), 2), ("RIGHTPADDING", (0,0), (-1,-1), 2),
         ("TOPPADDING", (0,0), (-1,-1), 2), ("BOTTOMPADDING", (0,0), (-1,-1), 2),
     ]))
+    type_demande = str(request_data.get("type_demande", "Stage rémunéré") or "Stage rémunéré").strip()
+    titre_demande = ("DEMANDE DE STAGE PROFESSIONNEL NON RÉMUNÉRÉ"
+                     if type_demande == "Stage non rémunéré"
+                     else "DEMANDE DE STAGE PROFESSIONNEL RÉMUNÉRÉ")
     story = [
         header_table, Spacer(1, 8),
-        para("DEMANDE DE STAGE PROFESSIONNEL RÉMUNÉRÉ", "CenterTitleFGE"),
+        para(titre_demande, "CenterTitleFGE"),
         Spacer(1, 8),
         para("Informations des étudiants demandeurs", "SectionFGE")
     ]
@@ -1339,6 +1366,7 @@ if page == "Demande de stage":
                        "programme":programme.strip(),
                        "debut":debut.isoformat(),"fin":fin.isoformat(),
                        "observations":observations.strip(),
+                       "type_demande": selected_stage_type,
                        "ccp_number":main_ccp,
                        "adresse_domicile":main_student.get("adresse_domicile", "")}
                 pdf = build_request_pdf(req, participants)
