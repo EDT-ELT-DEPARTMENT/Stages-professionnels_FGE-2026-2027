@@ -150,6 +150,38 @@ def load_permanent_teachers(path, modified_time):
     return sorted(df["_label"].tolist(), key=lambda x: x.casefold())
 
 
+@st.cache_data
+def load_permanent_teacher_grades(path, modified_time):
+    """Associe chaque enseignant permanent à son grade depuis le fichier source."""
+    df = pd.read_excel(path, sheet_name="Permanents-Vacataires", dtype=object)
+    required = ["NOM", "PRÉNOM", "Qualité", "Grade"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError("Colonnes absentes du fichier des enseignants : " + ", ".join(missing))
+    quality = df["Qualité"].astype(str).str.strip().str.casefold()
+    df = df[quality.isin({"permanent", "permanente"})].copy()
+    df["_label"] = (df["NOM"].fillna("").astype(str).str.strip() + " " +
+                    df["PRÉNOM"].fillna("").astype(str).str.strip()).str.strip()
+    df["_grade"] = df["Grade"].fillna("").astype(str).str.strip()
+    df = df[df["_label"] != ""].drop_duplicates("_label")
+    return dict(zip(df["_label"], df["_grade"]))
+
+
+def supervisor_name_with_grade(name):
+    """Affiche le nom du superviseur suivi de son grade source, si disponible."""
+    clean_name = str(name or "").strip()
+    if not clean_name:
+        return "Non renseigné"
+    try:
+        grades = load_permanent_teacher_grades(
+            str(TEACHERS_FILE), TEACHERS_FILE.stat().st_mtime
+        )
+    except Exception:
+        grades = {}
+    grade = grades.get(clean_name, "")
+    return f"{clean_name} - {grade}" if grade else clean_name
+
+
 def _replace_docx_paragraph(paragraph, replacements):
     original = paragraph.text
     updated = original
@@ -948,10 +980,11 @@ def build_request_pdf(request_data, participants):
         ("BOTTOMPADDING", (0,0), (-1,-1), 6),
     ]))
     story += [student_table, Spacer(1, 9), para("Encadrement du stage", "SectionFGE")]
+    superviseur_affiche = supervisor_name_with_grade(request_data.get("superviseur", ""))
 
     supervisor_rows = [
         [para("Enseignant superviseur (Permanent)", "LabelFGE"),
-         para(request_data.get("superviseur", "Non renseigné"))],
+         para(superviseur_affiche)],
         [para("Programme détaillé du stage", "LabelFGE"),
          para(request_data.get("programme", "Non renseigné"))]
     ]
@@ -964,7 +997,7 @@ def build_request_pdf(request_data, participants):
     supervisor_signature = Table(
         [
             [para("Signature de l'enseignant superviseur", "LabelFGE"), ""],
-            [para("Nom et prénom :", "LabelFGE"), para(request_data.get("superviseur", ""))],
+            [para("Nom et prénom :", "LabelFGE"), para(superviseur_affiche)],
         ],
         colWidths=[4.8*cm, usable_width-4.8*cm],
         rowHeights=[2.0*cm, 0.65*cm],
@@ -1542,6 +1575,23 @@ elif page == "Administration":
                 entreprise,sujet_stage,type_demande,statut,participants_json FROM demandes ORDER BY id DESC""",con)
         st.metric("Nombre total de demandes",len(data))
 
+        # Liste administrative distincte des demandeurs de visite en entreprise.
+        st.markdown("### 📋 Liste des demandeurs de visite en entreprise (Excel)")
+        with sqlite3.connect(DB_FILE) as con_vis_admin:
+            visites_admin_df = visites_export_df(con_vis_admin)
+        st.metric("Nombre de demandes de visite en entreprise", int(len(visites_admin_df)))
+        if visites_admin_df.empty:
+            st.info("Aucune demande de visite en entreprise n'est actuellement enregistrée.")
+        else:
+            st.dataframe(visites_admin_df, use_container_width=True, hide_index=True)
+            st.download_button(
+                "📊 Télécharger la liste des demandeurs de visite (Excel)",
+                data=df_to_excel_bytes(visites_admin_df, "Demandeurs de visite"),
+                file_name="Liste_demandeurs_visite_entreprise_FGE_2026-2027.xlsx",
+                mime=XLSX_MIME,
+                key="admin_excel_liste_visites_entreprise"
+            )
+
         # Tableau de bord des avis favorables. Le masquage de l'historique ne
         # supprime jamais les décisions de la base : elles continuent à bloquer
         # automatiquement une nouvelle demande pour les matricules concernés.
@@ -1694,8 +1744,16 @@ elif page == "Administration":
             # Export Excel multi-feuilles : demandes principales + détail des participants.
             xlsx_buffer = io.BytesIO()
             export_data = data.drop(columns=["participants_json"]).copy()
-            export_data.insert(0, "Référence", export_data.apply(
-                lambda rec: reference_demande(rec["id"], rec.get("type_demande", "Stage rémunéré")), axis=1))
+            # La colonne Référence peut déjà être présente dans data :
+            # on la remplace dans ce cas au lieu de tenter une seconde insertion.
+            reference_values = export_data.apply(
+                lambda rec: reference_demande(rec["id"], rec.get("type_demande", "Stage rémunéré")), axis=1)
+            if "Référence" in export_data.columns:
+                export_data["Référence"] = reference_values
+                ordered_cols = ["Référence"] + [c for c in export_data.columns if c != "Référence"]
+                export_data = export_data[ordered_cols]
+            else:
+                export_data.insert(0, "Référence", reference_values)
             participant_rows = []
             for _, rec in data.iterrows():
                 try: plist = json.loads(rec.get("participants_json") or "[]")
