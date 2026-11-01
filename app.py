@@ -216,6 +216,75 @@ def remplir_tableau_assiduite(doc, date_debut, date_fin):
             table.cell(idx,2).text = ""
         current += timedelta(days=1)
 
+ANNEES_FR = {"1": "première", "2": "deuxième", "3": "troisième", "4": "quatrième", "5": "cinquième"}
+SPECIALITES_INGENIEUR = {"EI": "électricité industrielle", "RSE": "réseaux et sources d'énergie"}
+SPECIALITES_MASTER = {"RE": "réseaux électriques", "ER": "énergies renouvelables",
+                      "ME": "machines électriques", "CE": "commandes électriques"}
+
+def _maj(s):
+    return s[:1].upper() + s[1:]
+
+def decode_promotion(promotion):
+    """Décode un code de promotion pour remplir TOUS les endroits du document généré.
+
+    ING<3|4|5><EI|RSE> : ingénieur ; M<1|2><RE|ER|ME|CE> : Master ; M<1|2>MCIL : Master en électrotechnique ;
+    MCIL<2|3> : Licence en électrotechnique.
+    Clés renvoyées : inscrit (« Inscrit (e) en … »), specialite (« Spécialité : … »),
+    diplome_stage (« obtention de diplôme … » de l'article 2), passage (fin de la phrase de l'article 1).
+    """
+    code = norm_promo(promotion)
+    m = re.fullmatch(r"ING([345])(EI|RSE)", code)
+    if m:
+        annee, spec = ANNEES_FR[m.group(1)], SPECIALITES_INGENIEUR[m.group(2)]
+        return {"inscrit": f"{annee} année Ingénieur", "specialite": _maj(spec), "diplome_stage": "d'ingénieur",
+                "passage": f"en {annee} année en vue de l’obtention du diplôme d'ingénieur en {spec}."}
+    m = re.fullmatch(r"M([12])(RE|ER|ME|CE)", code)
+    if m:
+        annee, spec = ANNEES_FR[m.group(1)], SPECIALITES_MASTER[m.group(2)]
+        return {"inscrit": f"{annee} année Master", "specialite": _maj(spec), "diplome_stage": "de master",
+                "passage": f"en {annee} année en vue de l’obtention du diplôme Master en {spec}."}
+    m = re.fullmatch(r"M([12])MCIL", code)
+    if m:
+        annee = ANNEES_FR[m.group(1)]
+        return {"inscrit": f"{annee} année Master ({code})", "specialite": "Électrotechnique", "diplome_stage": "de master",
+                "passage": f"en {annee} année ({code}) en vue de l’obtention du diplôme Master en électrotechnique."}
+    m = re.fullmatch(r"MCIL([23])", code)
+    if m:
+        annee = ANNEES_FR[m.group(1)]
+        return {"inscrit": f"{annee} année Licence (MCIL)", "specialite": "Électrotechnique", "diplome_stage": "de licence",
+                "passage": f"en {annee} année MCIL en vue de l’obtention du diplôme de Licence en électrotechnique."}
+    return {"inscrit": promotion or "", "specialite": promotion or "", "diplome_stage": "de master",
+            "passage": f"en vue de l’obtention du diplôme ({promotion})." if promotion else "en vue de l’obtention du diplôme."}
+
+def stage_passage_for_promotion(promotion):
+    """Fin de la phrase « Le stage concerne l'étudiant(e) … » selon la promotion."""
+    return decode_promotion(promotion)["passage"]
+
+def _iter_paragraphs(container):
+    for paragraph in getattr(container, "paragraphs", []):
+        yield paragraph
+    for table in getattr(container, "tables", []):
+        for row in table.rows:
+            for cell in row.cells:
+                yield from _iter_paragraphs(cell)
+
+def fix_stage_passage(doc, full_name, promotion):
+    """Réécrit la fin du paragraphe « Le stage concerne l'étudiant(e) … » avec l'année et la spécialité exactes."""
+    nbsp = "\xa0"
+    passage = stage_passage_for_promotion(promotion)
+    for paragraph in _iter_paragraphs(doc):
+        found = re.search(r"Le stage concerne l.étudiant\(e\)", paragraph.text)
+        if not found:
+            continue
+        new_text = f"{paragraph.text[:found.end()]}{nbsp}{full_name} inscrit (e){nbsp}{passage}"
+        runs = paragraph.runs
+        if runs:  # on garde la mise en forme du premier run
+            runs[0].text = new_text
+            for extra in runs[1:]:
+                extra.text = ""
+        else:
+            paragraph.text = new_text
+
 def build_three_stage_documents(request_data, student, nb_participants=1):
     """Remplit le modèle institutionnel (assiduité + convention + attestation) pour UN SEUL étudiant.
 
@@ -237,6 +306,7 @@ def build_three_stage_documents(request_data, student, nb_participants=1):
     domicile = s.get("adresse_domicile") or ""
     matricule = s.get("matricule") or ""
     promotion = s.get("promotion") or r.get("promotion", "")
+    info = decode_promotion(promotion)
     replacements = {
         "ablasaoudi99@gmail.com": s.get("email", ""),
         "666187646": s.get("telephone", ""),
@@ -247,9 +317,11 @@ def build_three_stage_documents(request_data, student, nb_participants=1):
         "Adresse : Hassi Messaoud-Ouargla": f"Adresse : {domicile}",
         "Adresse\xa0: Hassi Messaoud-Ouargla": f"Adresse : {domicile}",
         "2025-2026": "2026-2027",
-        "2 éme année Licence": promotion,
+        "2 éme année Licence": info["inscrit"],
         "Electrotechnique": "Electrotechnique",
-        "MCIL Electrotechnique": promotion,
+        "MCIL Electrotechnique": info["specialite"],
+        # Article 2 : le diplôme dépend du cycle (ingénieur / master / licence).
+        "obtention de diplôme de master": f"obtention de diplôme {info['diplome_stage']}",
         # Date de signature de la convention : date réelle de génération du document.
         "22-04-2026": datetime.now().strftime("%d-%m-%Y"),
         "22/03/2026": start, "04/04/2026": end,
@@ -274,6 +346,7 @@ def build_three_stage_documents(request_data, student, nb_participants=1):
                 for cell in row.cells:
                     walk_paragraphs(cell)
     walk_paragraphs(doc)
+    fix_stage_passage(doc, full_name, promotion)
     out = io.BytesIO()
     doc.save(out)
     return out.getvalue()
