@@ -65,10 +65,12 @@ LOGO_CANDIDATES = [APP_DIR / "logo.PNG", APP_DIR / "logo.png", APP_DIR / "logo_f
 LOGO_FILE = next((p for p in LOGO_CANDIDATES if p.is_file()), None)
 
 PROMOTIONS_STAGE_REMUNERE = {
-    "M1CE", "M1ER", "M1RE", "M1ME", "M2CE", "M2ER", "M2RE", "M2ME",
+    "M2CE", "M2ER", "M2RE", "M2ME",
     "M1MCIL", "M2MCIL", "MCIL2", "MCIL3", "ING3EI", "ING3RSE",
     "ING4EI", "ING4RSE", "ING5RSE",
 }
+TYPES_DEMANDE_STAGE = ("Stage rémunéré", "Stage non rémunéré")
+
 
 st.set_page_config(page_title="Stages professionnels FGE 2026-2027", page_icon="🎓", layout="wide")
 st.markdown("""
@@ -545,7 +547,7 @@ def ensure_dossiers(con, rid):
 
 def ensure_all_dossiers(con):
     ids = [r[0] for r in con.execute("""SELECT id FROM demandes
-        WHERE COALESCE(type_demande, 'Stage rémunéré') = 'Stage rémunéré'
+        WHERE COALESCE(type_demande, 'Stage rémunéré') IN ('Stage rémunéré','Stage non rémunéré')
           AND id NOT IN (SELECT DISTINCT demande_id FROM dossiers_etudiants)""")]
     for rid in ids:
         ensure_dossiers(con, rid)
@@ -579,7 +581,7 @@ def favorable_dossiers_for(con, matricule_key):
             d.vice_dean_comment AS vice_dean_comment, r.statut AS statut
         FROM dossiers_etudiants d JOIN demandes r ON r.id = d.demande_id
         WHERE d.matricule_key = ? AND TRIM(COALESCE(d.vice_dean_avis, '')) = 'Avis favorable'
-          AND COALESCE(r.type_demande, 'Stage rémunéré') = 'Stage rémunéré'
+          AND COALESCE(r.type_demande, 'Stage rémunéré') IN ('Stage rémunéré','Stage non rémunéré')
         ORDER BY d.id DESC""", (matricule_key,))
     cols = [c[0] for c in cur.description]
     return [dict(zip(cols, row)) for row in cur.fetchall()]
@@ -616,7 +618,7 @@ def refresh_request_status(con, rid):
     con.execute("UPDATE demandes SET statut=?, vice_dean_avis=? WHERE id=?", (statut, avis, rid))
 
 def reference_demande(demande_id, type_demande="Stage rémunéré"):
-    """Référence lisible : STG pour un stage, VIS pour une visite."""
+    """Référence lisible : STG pour tout stage (rémunéré ou non), VIS pour une visite."""
     prefix = "VIS" if str(type_demande or "").strip().lower() in {"visite en entreprise", "visite"} else "STG"
     return f"{prefix}-{int(demande_id):05d}"
 
@@ -654,27 +656,28 @@ def visites_export_df(con):
 
 def dossiers_export_df(con, where="", params=(), include_ccp=True):
     """Une ligne par étudiant : sa demande et l'avis du Vice-doyen le concernant."""
-    sql = """SELECT r.id, d.matricule, d.nom, d.prenom, COALESCE(NULLIF(d.promotion, ''), r.promotion),
+    sql = """SELECT r.id, r.type_demande, d.matricule, d.nom, d.prenom, COALESCE(NULLIF(d.promotion, ''), r.promotion),
             d.ccp_number, r.entreprise, r.sujet_stage, r.enseignant_superviseur, r.date_debut, r.date_fin,
             r.date_soumission, r.statut, d.documents_docx IS NOT NULL, d.documents_date,
             d.vice_dean_avis, d.vice_dean_date, d.vice_dean_comment
         FROM dossiers_etudiants d JOIN demandes r ON r.id = d.demande_id
-        WHERE COALESCE(r.type_demande, 'Stage rémunéré') = 'Stage rémunéré'"""
+        WHERE COALESCE(r.type_demande, 'Stage rémunéré') IN ('Stage rémunéré','Stage non rémunéré')"""
     if where:
         sql += " AND (" + where + ")"
     sql += " ORDER BY r.id DESC, d.id"
     out = []
     for r in con.execute(sql, params).fetchall():
-        avis = (r[15] or "").strip()
+        type_stage = r[1] or "Stage rémunéré"
+        avis = (r[16] or "").strip()
         if not avis:
             avis = "En attente de l'avis du Vice-doyen" if r[13] else "Dossier pas encore transmis au Vice-doyen"
-        row = {"Référence": reference_demande(r[0], "Stage rémunéré"), "Matricule": r[1], "Nom": r[2], "Prénom": r[3], "Promotion": r[4]}
+        row = {"Référence": reference_demande(r[0], type_stage), "Type de stage": type_stage, "Matricule": r[2], "Nom": r[3], "Prénom": r[4], "Promotion": r[5]}
         if include_ccp:
-            row["N° CCP"] = r[5] or ""
-        row.update({"Entreprise": r[6], "Sujet du stage": r[7], "Enseignant superviseur": r[8],
-                    "Début": r[9], "Fin": r[10], "Date de soumission": r[11], "Statut de la demande": r[12],
-                    "Documents générés le": r[14] or "", "Avis du Vice-doyen": avis,
-                    "Date de l'avis": r[16] or "", "Observation / motif": r[17] or ""})
+            row["N° CCP"] = r[6] or ""
+        row.update({"Entreprise": r[7], "Sujet du stage": r[8], "Enseignant superviseur": r[9],
+                    "Début": r[10], "Fin": r[11], "Date de soumission": r[12], "Statut de la demande": r[13],
+                    "Documents générés le": r[15] or "", "Avis du Vice-doyen": avis,
+                    "Date de l'avis": r[17] or "", "Observation / motif": r[18] or ""})
         out.append(row)
     return pd.DataFrame(out)
 
@@ -703,7 +706,7 @@ def demandeurs_situation_df(con):
             r.date_soumission, r.signed_pdf IS NOT NULL, d.documents_docx IS NOT NULL,
             TRIM(COALESCE(d.vice_dean_avis, '')), d.vice_dean_date, d.vice_dean_comment
         FROM dossiers_etudiants d JOIN demandes r ON r.id = d.demande_id
-        WHERE COALESCE(r.type_demande, 'Stage rémunéré') = 'Stage rémunéré'
+        WHERE COALESCE(r.type_demande, 'Stage rémunéré') IN ('Stage rémunéré','Stage non rémunéré')
         ORDER BY r.id DESC, d.id""").fetchall()
     out = []
     for r in rows:
@@ -1109,18 +1112,32 @@ if page == "Demande de stage":
                 st.caption(f"Avis favorable précédent : STG-{int(previous['id']):05d} — "
                            f"{previous.get('vice_dean_date') or 'date non renseignée'}.")
 
-            if norm_promo(main_student["promotion"]) not in PROMOTIONS_STAGE_REMUNERE:
-                st.warning(f"Votre promotion ({main_student['promotion']}) n'est pas éligible au stage rémunéré. Vous êtes automatiquement orienté(e) vers la visite en entreprise.")
+            if norm_promo(main_student["promotion"]) in PROMOTIONS_STAGE_REMUNERE:
+                selected_stage_type = "Stage rémunéré"
+                st.success(f"Étudiant reconnu : {main_student['nom']} {main_student['prenom']} — {main_student['promotion']} — stage rémunéré autorisé.")
             else:
-                st.success(f"Étudiant reconnu : {main_student['nom']} {main_student['prenom']} — {main_student['promotion']}")
+                st.warning(f"Votre promotion ({main_student['promotion']}) n'est pas éligible au stage rémunéré. Vous pouvez choisir une visite en entreprise ou un stage non rémunéré.")
+                selected_stage_type = st.radio(
+                    "Choisissez le type de demande",
+                    ["Visite en entreprise", "Stage non rémunéré"],
+                    horizontal=True,
+                    key=f"type_demande_non_eligible_{normalize_matricule(main_student['matricule'])}"
+                )
+                if (selected_stage_type == "Stage non rémunéré" and favorable_previous_requests
+                        and not reapply_authorized):
+                    previous = favorable_previous_requests[0]
+                    st.error("⛔ Un avis favorable a déjà été accordé pour une demande de stage de ce matricule. Le dépôt d'une nouvelle demande de stage non rémunéré est bloqué.")
+                    st.warning(f"Dossier précédent : {reference_demande(previous['id'], 'Stage non rémunéré')} — {previous.get('entreprise') or 'Organisme non renseigné'} — avis du {previous.get('vice_dean_date') or 'date non renseignée'}.")
+                    st.info("Si une nouvelle demande est exceptionnellement autorisée, l'administration peut utiliser la procédure de dérogation à usage unique.")
+                    st.stop()
 
     pending_request = None
-    if main_student and norm_promo(main_student["promotion"]) in PROMOTIONS_STAGE_REMUNERE:
+    if main_student and selected_stage_type in TYPES_DEMANDE_STAGE:
         # Reprendre la dernière demande envoyée mais dont le document signé manque.
         with sqlite3.connect(DB_FILE) as con:
             row_pending = con.execute(
-                "SELECT * FROM demandes WHERE matricule=? AND type_demande='Stage rémunéré' AND signed_pdf IS NULL ORDER BY id DESC LIMIT 1",
-                (normalize_matricule(main_student["matricule"]),)
+                "SELECT * FROM demandes WHERE matricule=? AND type_demande=? AND signed_pdf IS NULL ORDER BY id DESC LIMIT 1",
+                (normalize_matricule(main_student["matricule"]), selected_stage_type)
             ).fetchone()
             if row_pending:
                 cols_pending = [d[1] for d in con.execute("PRAGMA table_info(demandes)")]
@@ -1134,7 +1151,7 @@ if page == "Demande de stage":
                                         (pending_request["id"],)):
                     saved_dossiers[r_sd[0]] = {"ccp_number": r_sd[1] or "", "has_cheque": bool(r_sd[2])}
         if pending_request:
-            st.info(f"Une demande existe déjà pour votre matricule (référence STG-{pending_request['id']:05d}). "
+            st.info(f"Une demande existe déjà pour votre matricule (référence {reference_demande(pending_request['id'], selected_stage_type)}). "
                     "Son document signé n'a pas encore été déposé. Vos informations sont reprises ci-dessous : vous pouvez les modifier et régénérer le formulaire.")
         with st.container(border=True):
             st.markdown("**Coordonnées du demandeur principal (issues du fichier source)**")
@@ -1146,7 +1163,7 @@ if page == "Demande de stage":
             st.write(f"Téléphone : {main_student['telephone']} | E-mail : {main_student['email']}")
 
         st.markdown('<div class="section">2. Ajouter un ou plusieurs camarades</div>', unsafe_allow_html=True)
-        st.write("Saisissez les matricules des camarades, un matricule par ligne. Tous les participants doivent appartenir aux promotions autorisées.")
+        st.write("Saisissez les matricules des camarades, un matricule par ligne. Pour un stage rémunéré, tous les participants doivent appartenir aux promotions autorisées.")
         pending_participants = []
         if pending_request:
             try: pending_participants = json.loads(pending_request.get("participants_json") or "[]")
@@ -1179,7 +1196,7 @@ if page == "Demande de stage":
             saved_record = pending_by_matricule.get(mk)
             if saved_record:
                 record.update({k: v for k, v in saved_record.items() if k in record})
-            if norm_promo(record["promotion"]) not in PROMOTIONS_STAGE_REMUNERE:
+            if selected_stage_type == "Stage rémunéré" and norm_promo(record["promotion"]) not in PROMOTIONS_STAGE_REMUNERE:
                 companion_errors.append(f"{record['nom']} {record['prenom']} ({record['promotion']}) n'est pas éligible au stage rémunéré.")
                 continue
             with sqlite3.connect(DB_FILE) as con_c:
@@ -1346,7 +1363,7 @@ if page == "Demande de stage":
                             enseignant_superviseur,programme_stage,date_debut,date_fin,observations,wilaya_residence,ville_naissance,
                             wilaya_naissance,date_naissance,lieu_naissance,type_demande,participants_json,statut,ccp_number,cheque_barre,adresse_domicile)
                             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                            (values[-1], values[0], main_student["matricule"], *values[1:30], "Stage rémunéré", values[30], "En attente du document signé", main_ccp, main_cheque, main_student.get("adresse_domicile", "")))
+                            (values[-1], values[0], main_student["matricule"], *values[1:30], selected_stage_type, values[30], "En attente du document signé", main_ccp, main_cheque, main_student.get("adresse_domicile", "")))
                         rid = cur.lastrowid
                     # Dossiers individuels : un CCP et un chèque barré par étudiant.
                     save_dossiers(con, rid, participants, cheque_by_key)
@@ -1369,10 +1386,10 @@ if page == "Demande de stage":
         active_id = st.session_state.get("active_request_id")
         if active_id and st.session_state.get("active_pdf"):
             st.markdown('<div class="section">5. Télécharger, faire signer et déposer le formulaire</div>', unsafe_allow_html=True)
-            st.success(f"Formulaire généré — Référence {reference_demande(active_id, "Stage rémunéré")}.")
+            st.success(f"Formulaire généré — Référence {reference_demande(active_id, selected_stage_type)}.")
             st.download_button("⬇️ Télécharger le formulaire PDF à imprimer et faire signer",
                                data=st.session_state["active_pdf"],
-                               file_name=f"Demande_stage_FGE_STG-{active_id:05d}.pdf",
+                               file_name=f"Demande_stage_FGE_{reference_demande(active_id, selected_stage_type)}.pdf",
                                mime="application/pdf", use_container_width=True)
             st.info("Imprimez le formulaire, faites signer et cacheter l'avis favorable par l'établissement d'accueil, puis numérisez le document signé en PDF.")
             signed_file = st.file_uploader("Téléverser le formulaire signé (PDF uniquement)", type=["pdf"], key=f"signed_{active_id}")
@@ -1392,11 +1409,11 @@ if page == "Demande de stage":
                                 con.commit()
                             st.session_state.pop("active_request_id",None)
                             st.session_state.pop("active_pdf",None)
-                            st.success(f"Demande STG-{active_id:05d} transmise au Chef de département.")
+                            st.success(f"Demande {reference_demande(active_id, selected_stage_type)} transmise au Chef de département.")
                             st.info("Le statut de votre demande est désormais : Transmise au Chef de département.")
-    elif main_student:
+    elif main_student and selected_stage_type == "Visite en entreprise":
         st.markdown('<div class="section">2. Demande de visite en entreprise</div>', unsafe_allow_html=True)
-        st.info("Votre promotion n'appartient pas aux promotions autorisées au stage rémunéré. Votre demande est donc traitée comme une visite en entreprise. Le document officiel Visite.docx sera généré automatiquement dès l'envoi.")
+        st.info("Votre demande est traitée comme une visite en entreprise. Le document officiel Visite.docx sera généré automatiquement dès l'envoi.")
         with st.form("visit_form"):
             st.markdown("**Vérification et renseignements personnels du candidat**")
             vc1, vc2 = st.columns(2)
@@ -1502,7 +1519,7 @@ elif page == "Administration":
                 d.vice_dean_date AS "Date de l'avis favorable", d.vice_dean_comment AS "Observation"
                 FROM dossiers_etudiants d JOIN demandes r ON r.id = d.demande_id
                 WHERE TRIM(COALESCE(d.vice_dean_avis, '')) = 'Avis favorable'
-                  AND COALESCE(r.type_demande, 'Stage rémunéré') = 'Stage rémunéré'
+                  AND COALESCE(r.type_demande, 'Stage rémunéré') IN ('Stage rémunéré','Stage non rémunéré')
                 ORDER BY d.id DESC""", con)
         if not approved_people_df.empty:
             approved_people_df = approved_people_df.drop_duplicates(subset=["Matricule"])
@@ -1517,7 +1534,7 @@ elif page == "Administration":
                 "Demandeurs_avis_favorables_FGE_2026-2027.csv", "text/csv")
 
         # Liste complète des demandeurs par situation (Excel)
-        st.markdown("### 📋 Liste des demandeurs de stage par situation (Excel)")
+        st.markdown("### 📋 Liste des demandeurs de stage rémunéré et non rémunéré par situation (Excel)")
         with sqlite3.connect(DB_FILE) as con_s:
             situ_df = demandeurs_situation_df(con_s)
         if situ_df.empty:
@@ -1665,16 +1682,16 @@ elif page == "Administration":
                 st.download_button("📊 Excel — demandes par étudiant et leur avis", df_to_excel_bytes(all_df),
                                    "Demandes_et_avis_FGE_2026-2027.xlsx", XLSX_MIME, key="admin_excel_avis")
             st.markdown("### Consulter le formulaire signé")
-            stage_data = data[data["type_demande"].fillna("Stage rémunéré") == "Stage rémunéré"]
-            st.markdown("### Consulter le formulaire signé d'un stage")
+            stage_data = data[data["type_demande"].fillna("Stage rémunéré").isin(TYPES_DEMANDE_STAGE)]
+            st.markdown("### Consulter le formulaire signé d'un stage (rémunéré ou non rémunéré)")
             selected=st.selectbox("Référence de demande de stage",options=stage_data["id"].tolist(),
-                                  format_func=lambda x:reference_demande(x, "Stage rémunéré"))
+                                  format_func=lambda x:reference_demande(x, data.loc[data.id==x, "type_demande"].iloc[0]))
             with sqlite3.connect(DB_FILE) as con:
                 row=con.execute("SELECT signed_pdf,statut FROM demandes WHERE id=?",(selected,)).fetchone()
             if row and row[0]:
                 st.success(f"Statut : {row[1]}")
                 st.download_button("⬇️ Télécharger le formulaire signé",data=bytes(row[0]),
-                                   file_name=f"Demande_signee_{reference_demande(selected, 'Stage rémunéré')}.pdf",mime="application/pdf")
+                                   file_name=f"Demande_signee_{reference_demande(selected, data.loc[data.id==selected, 'type_demande'].iloc[0])}.pdf",mime="application/pdf")
             elif row:
                 st.warning(f"Statut : {row[1]} — le document signé n'a pas encore été déposé.")
     elif pwd: st.error("Mot de passe incorrect.")
@@ -1691,7 +1708,7 @@ elif page == "Chef de département":
         with sqlite3.connect(DB_FILE) as con:
             ensure_all_dossiers(con)
             con.commit()
-            chef_data = pd.read_sql_query("SELECT id, date_soumission, matricule, nom, prenom, entreprise, sujet_stage, statut FROM demandes WHERE type_demande='Stage rémunéré' ORDER BY id DESC", con)
+            chef_data = pd.read_sql_query("SELECT id, date_soumission, matricule, nom, prenom, entreprise, sujet_stage, statut, type_demande FROM demandes WHERE type_demande IN ('Stage rémunéré','Stage non rémunéré') ORDER BY id DESC", con)
         if chef_data.empty:
             st.info("Aucune demande de stage.")
         else:
@@ -1701,7 +1718,7 @@ elif page == "Chef de département":
                 st.download_button("📊 Excel — demandes par étudiant et leur avis", df_to_excel_bytes(chef_df),
                                    "Demandes_et_avis_FGE_2026-2027.xlsx", XLSX_MIME, key="chef_excel")
             ids = chef_data["id"].tolist()
-            selected_chef = st.selectbox("Demande à traiter", ids, format_func=lambda x: f"STG-{x:05d} — " + str(chef_data.loc[chef_data.id==x, "nom"].iloc[0]) + " " + str(chef_data.loc[chef_data.id==x, "prenom"].iloc[0]))
+            selected_chef = st.selectbox("Demande à traiter", ids, format_func=lambda x: f"{reference_demande(x, chef_data.loc[chef_data.id==x, 'type_demande'].iloc[0])} — " + str(chef_data.loc[chef_data.id==x, "nom"].iloc[0]) + " " + str(chef_data.loc[chef_data.id==x, "prenom"].iloc[0]))
             with sqlite3.connect(DB_FILE) as con:
                 con.row_factory = sqlite3.Row
                 rec = con.execute("SELECT * FROM demandes WHERE id=?", (selected_chef,)).fetchone()
@@ -1711,7 +1728,7 @@ elif page == "Chef de département":
             st.write(f"**Statut de la demande :** {rec.get('statut') or '—'}")
             if rec.get("signed_pdf"):
                 st.download_button("Télécharger la demande signée par l'étudiant", bytes(rec["signed_pdf"]),
-                                   f"Demande_signee_STG-{selected_chef:05d}.pdf", "application/pdf",
+                                   f"Demande_signee_{reference_demande(selected_chef, rec.get('type_demande'))}.pdf", "application/pdf",
                                    key=f"chef_signed_{selected_chef}")
                 st.markdown("### Dossiers individuels des étudiants")
                 st.caption("Chaque étudiant a son propre CCP, son propre chèque barré et ses propres documents "
@@ -1757,7 +1774,7 @@ elif page == "Chef de département":
                             cheque_ext = ".pdf" if cheque_bytes.startswith(b"%PDF") else (".png" if cheque_bytes.startswith(b"\x89PNG") else ".jpg")
                             cheque_mime = "application/pdf" if cheque_ext == ".pdf" else "image/png" if cheque_ext == ".png" else "image/jpeg"
                             st.download_button("Télécharger le chèque barré", cheque_bytes,
-                                f"Cheque_barre_STG-{selected_chef:05d}_{dos['matricule_key']}{cheque_ext}", cheque_mime,
+                                f"Cheque_barre_{reference_demande(selected_chef, rec.get('type_demande'))}_{dos['matricule_key']}{cheque_ext}", cheque_mime,
                                 key=f"chef_cheque_{dos['id']}")
                         else:
                             st.warning("Chèque barré non fourni pour cet étudiant.")
@@ -1770,7 +1787,7 @@ elif page == "Chef de département":
                                 st.error(f"Impossible de générer les documents : {exc}")
                         if dos.get("documents_docx"):
                             st.download_button("Télécharger les trois documents de cet étudiant (DOCX)", bytes(dos["documents_docx"]),
-                                f"Documents_stage_STG-{selected_chef:05d}_{dos['matricule_key']}.docx",
+                                f"Documents_stage_{reference_demande(selected_chef, rec.get('type_demande'))}_{dos['matricule_key']}.docx",
                                 "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                                 key=f"chef_docs_{dos['id']}")
                             st.caption(f"Documents générés le {dos.get('documents_date') or '—'}")
@@ -1794,7 +1811,7 @@ elif page == "Chef de département":
                 chef_observation,visite_date_generation,visite_docx IS NOT NULL AS document_genere
                 FROM demandes WHERE type_demande='Visite en entreprise' ORDER BY id DESC""", con)
             visit_export_df = visites_export_df(con)
-        st.caption("Suivi séparé des demandes de visite : références VIS-xxxxx, distinctes des dossiers de stage STG-xxxxx.")
+        st.caption("Suivi séparé des demandes de visite : références VIS-xxxxx. Les stages rémunérés et non rémunérés utilisent STG-xxxxx.")
         st.metric("Nombre de demandes de visite", int(len(visit_df)))
         if visit_df.empty:
             st.info("Aucune demande de visite enregistrée.")
@@ -1875,7 +1892,7 @@ elif page == "Vice-doyen":
             con.commit()
             # Un enregistrement PAR ÉTUDIANT : chacun reçoit son propre avis.
             vd_data = pd.read_sql_query("""SELECT d.id AS dossier_id, d.demande_id, d.matricule, d.nom, d.prenom,
-                d.documents_date, d.vice_dean_avis, d.vice_dean_comment, r.entreprise, r.statut
+                d.documents_date, d.vice_dean_avis, d.vice_dean_comment, r.entreprise, r.statut, r.type_demande
                 FROM dossiers_etudiants d JOIN demandes r ON r.id = d.demande_id
                 WHERE d.documents_docx IS NOT NULL
                 ORDER BY d.demande_id DESC, d.id""", con)
@@ -1900,16 +1917,17 @@ elif page == "Vice-doyen":
                 a_vd = str(r_vd["vice_dean_avis"] or "").strip()
                 etat = "✅ Avis favorable" if a_vd == AVIS_FAV else "❌ Avis défavorable" if a_vd == AVIS_DEF else "⏳ En attente"
                 labels_vd[int(r_vd["dossier_id"])] = (
-                    f"STG-{int(r_vd['demande_id']):05d} — {r_vd['nom']} {r_vd['prenom']} ({r_vd['matricule']}) — {etat}")
+                    f"{reference_demande(int(r_vd['demande_id']), r_vd['type_demande'])} — {r_vd['nom']} {r_vd['prenom']} ({r_vd['matricule']}) — {etat}")
             selected_vd = st.selectbox("Étudiant / dossier à examiner", list(labels_vd.keys()),
                                        format_func=lambda x: labels_vd.get(x, str(x)))
             with sqlite3.connect(DB_FILE) as con:
-                row_vd = con.execute("""SELECT documents_docx, vice_dean_avis, vice_dean_comment, demande_id,
-                    matricule, nom, prenom FROM dossiers_etudiants WHERE id=?""", (selected_vd,)).fetchone()
+                row_vd = con.execute("""SELECT d.documents_docx, d.vice_dean_avis, d.vice_dean_comment, d.demande_id,
+                    d.matricule, d.nom, d.prenom, r.type_demande FROM dossiers_etudiants d
+                    JOIN demandes r ON r.id=d.demande_id WHERE d.id=?""", (selected_vd,)).fetchone()
             if row_vd and row_vd[0]:
                 st.markdown(f"**Étudiant :** {row_vd[5]} {row_vd[6]} — {row_vd[4]}")
                 st.download_button("Consulter / télécharger les trois documents de cet étudiant", bytes(row_vd[0]),
-                    f"Documents_stage_STG-{int(row_vd[3]):05d}_{normalize_matricule(row_vd[4])}.docx",
+                    f"Documents_stage_{reference_demande(int(row_vd[3]), row_vd[7])}_{normalize_matricule(row_vd[4])}.docx",
                     "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                     key=f"vd_dl_{selected_vd}")
                 current_avis = (row_vd[1] or "").strip()
@@ -1941,11 +1959,11 @@ elif page == "Vice-doyen":
                             con.commit()
                         if click_fav:
                             st.session_state["vd_flash"] = (
-                                f"Avis favorable enregistré pour {row_vd[5]} {row_vd[6]} (STG-{int(row_vd[3]):05d}). "
+                                f"Avis favorable enregistré pour {row_vd[5]} {row_vd[6]} ({reference_demande(int(row_vd[3]), row_vd[7])}). "
                                 "Les autres étudiants de la demande ne sont pas concernés.")
                         else:
                             st.session_state["vd_flash"] = (
-                                f"Avis défavorable enregistré pour {row_vd[5]} {row_vd[6]} (STG-{int(row_vd[3]):05d}). "
+                                f"Avis défavorable enregistré pour {row_vd[5]} {row_vd[6]} ({reference_demande(int(row_vd[3]), row_vd[7])}). "
                                 "L'étudiant n'est pas bloqué et pourra déposer une nouvelle demande.")
                         st.rerun()
     elif pwd_vd:
