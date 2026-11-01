@@ -1272,21 +1272,24 @@ if page == "Demande de stage":
             debut = d1.date_input("Date prévue de début", value=default_debut)
             fin = d2.date_input("Date prévue de fin", value=default_fin)
             observations = st.text_area("Observations", value=(pending_request or {}).get("observations", ""))
-            st.markdown("**Coordonnées CCP et chèque barré — individuels pour chaque étudiant**")
-            st.caption("Chaque étudiant (y compris en binôme) saisit son propre numéro CCP et téléverse son propre chèque barré.")
             ccp_inputs, cheque_inputs = {}, {}
-            for p_form in participants:
-                pk_form = normalize_matricule(p_form.get("matricule", ""))
-                saved_form = saved_dossiers.get(pk_form, {})
-                with st.container(border=True):
-                    st.markdown(f"**{p_form.get('nom', '')} {p_form.get('prenom', '')}** — {p_form.get('matricule', '')}")
-                    cc1, cc2 = st.columns(2)
-                    ccp_inputs[pk_form] = cc1.text_input("Numéro CCP", value=str(saved_form.get("ccp_number") or ""),
-                                                         placeholder="Numéro CCP", key=f"ccp_{pk_form}")
-                    cheque_inputs[pk_form] = cc2.file_uploader("Chèque barré (image ou PDF)", type=["pdf", "png", "jpg", "jpeg"],
-                                                               key=f"cheque_{pk_form}")
-                    if saved_form.get("has_cheque"):
-                        cc2.caption("✅ Un chèque barré est déjà enregistré pour cet étudiant (téléversez un fichier uniquement pour le remplacer).")
+            if selected_stage_type == "Stage rémunéré":
+                st.markdown("**Coordonnées CCP et chèque barré — individuels pour chaque étudiant**")
+                st.caption("Chaque étudiant (y compris en binôme) saisit son propre numéro CCP et téléverse son propre chèque barré.")
+                for p_form in participants:
+                    pk_form = normalize_matricule(p_form.get("matricule", ""))
+                    saved_form = saved_dossiers.get(pk_form, {})
+                    with st.container(border=True):
+                        st.markdown(f"**{p_form.get('nom', '')} {p_form.get('prenom', '')}** — {p_form.get('matricule', '')}")
+                        cc1, cc2 = st.columns(2)
+                        ccp_inputs[pk_form] = cc1.text_input("Numéro CCP", value=str(saved_form.get("ccp_number") or ""),
+                                                             placeholder="Numéro CCP", key=f"ccp_{pk_form}")
+                        cheque_inputs[pk_form] = cc2.file_uploader("Chèque barré (image ou PDF)", type=["pdf", "png", "jpg", "jpeg"],
+                                                                   key=f"cheque_{pk_form}")
+                        if saved_form.get("has_cheque"):
+                            cc2.caption("✅ Un chèque barré est déjà enregistré pour cet étudiant (téléversez un fichier uniquement pour le remplacer).")
+            else:
+                st.info("Stage non rémunéré : aucun numéro CCP ni chèque barré n'est demandé aux étudiants.")
             create = st.form_submit_button("📄 Générer le formulaire à faire signer", use_container_width=True)
 
         if create:
@@ -1303,23 +1306,25 @@ if page == "Demande de stage":
                 pk_chk = normalize_matricule(p_chk.get("matricule", ""))
                 who = f"{p_chk.get('nom', '')} {p_chk.get('prenom', '')} ({p_chk.get('matricule', '')})"
                 up_chk = cheque_inputs.get(pk_chk)
-                if CCP_CHEQUE_OBLIGATOIRES:
-                    if not str(ccp_inputs.get(pk_chk, "") or "").strip():
-                        errors.append(f"Le numéro CCP de {who} est obligatoire.")
-                    if up_chk is None and not saved_dossiers.get(pk_chk, {}).get("has_cheque"):
-                        errors.append(f"Le chèque barré de {who} est obligatoire.")
-                if up_chk is not None and up_chk.size > 10 * 1024 * 1024:
-                    errors.append(f"Le chèque barré de {who} dépasse la limite de 10 Mo.")
+                if selected_stage_type == "Stage rémunéré":
+                    if CCP_CHEQUE_OBLIGATOIRES:
+                        if not str(ccp_inputs.get(pk_chk, "") or "").strip():
+                            errors.append(f"Le numéro CCP de {who} est obligatoire.")
+                        if up_chk is None and not saved_dossiers.get(pk_chk, {}).get("has_cheque"):
+                            errors.append(f"Le chèque barré de {who} est obligatoire.")
+                    if up_chk is not None and up_chk.size > 10 * 1024 * 1024:
+                        errors.append(f"Le chèque barré de {who} dépasse la limite de 10 Mo.")
             if errors:
                 for e in errors: st.error(e)
             else:
                 ccp_by_key, cheque_by_key = {}, {}
                 for p_ in participants:
                     pk_ = normalize_matricule(p_.get("matricule", ""))
-                    ccp_by_key[pk_] = str(ccp_inputs.get(pk_, "") or "").strip()
-                    p_["ccp_number"] = ccp_by_key[pk_]  # CCP propre à chaque étudiant (affiché dans le PDF)
+                    ccp_by_key[pk_] = (str(ccp_inputs.get(pk_, "") or "").strip()
+                                       if selected_stage_type == "Stage rémunéré" else "")
+                    p_["ccp_number"] = ccp_by_key[pk_]  # CCP individuel uniquement pour les stages rémunérés.
                     up_ = cheque_inputs.get(pk_)
-                    if up_ is not None:
+                    if selected_stage_type == "Stage rémunéré" and up_ is not None:
                         cheque_by_key[pk_] = up_.getvalue()
                 main_key_ = normalize_matricule(main_student["matricule"])
                 main_ccp = ccp_by_key.get(main_key_, "")  # colonnes historiques de `demandes` = demandeur principal
@@ -1367,6 +1372,10 @@ if page == "Demande de stage":
                         rid = cur.lastrowid
                     # Dossiers individuels : un CCP et un chèque barré par étudiant.
                     save_dossiers(con, rid, participants, cheque_by_key)
+                    if selected_stage_type == "Stage non rémunéré":
+                        # Aucun CCP ni chèque barré ne doit être demandé/conservé pour un stage non rémunéré.
+                        con.execute("UPDATE dossiers_etudiants SET ccp_number='', cheque_barre=NULL WHERE demande_id=?", (rid,))
+                        con.execute("UPDATE demandes SET ccp_number='', cheque_barre=NULL WHERE id=?", (rid,))
                     # L'autorisation de redépôt est à usage unique : elle est consommée
                     # au moment où la nouvelle demande est effectivement enregistrée.
                     matricules_a_consumer = [main_student.get("matricule", "")]
