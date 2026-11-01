@@ -584,6 +584,60 @@ def df_to_excel_bytes(df, sheet_name="Demandes et avis"):
 
 XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
+SITUATION_ORDER = ["Avis favorable", "En instance", "Avis défavorable", "Document signé non reçu"]
+
+def demandeurs_situation_df(con):
+    """Tous les demandeurs de stage (un par étudiant et par demande) avec leur situation, leur avis et l'observation.
+
+    Situations : « Document signé non reçu » (l'étudiant n'a pas encore déposé sa demande signée),
+    « En instance » (document signé reçu, avis pas encore rendu), « Avis favorable », « Avis défavorable ».
+    """
+    rows = con.execute("""SELECT r.id, r.matricule, d.matricule, d.nom, d.prenom, COALESCE(NULLIF(d.promotion, ''), r.promotion),
+            d.ccp_number, r.entreprise, r.sujet_stage, r.enseignant_superviseur, r.date_debut, r.date_fin,
+            r.date_soumission, r.signed_pdf IS NOT NULL, d.documents_docx IS NOT NULL,
+            TRIM(COALESCE(d.vice_dean_avis, '')), d.vice_dean_date, d.vice_dean_comment
+        FROM dossiers_etudiants d JOIN demandes r ON r.id = d.demande_id
+        WHERE COALESCE(r.type_demande, 'Stage rémunéré') = 'Stage rémunéré'
+        ORDER BY r.id DESC, d.id""").fetchall()
+    out = []
+    for r in rows:
+        signed, docs, avis = bool(r[13]), bool(r[14]), r[15]
+        if not signed:
+            situation, etape = "Document signé non reçu", "Chez l'étudiant (demande signée à déposer)"
+        elif avis == AVIS_FAV:
+            situation, etape = "Avis favorable", "Avis rendu"
+        elif avis == AVIS_DEF:
+            situation, etape = "Avis défavorable", "Avis rendu"
+        elif docs:
+            situation, etape = "En instance", "Chez le Vice-doyen (en attente d'avis)"
+        else:
+            situation, etape = "En instance", "Chez le Chef de département (documents à générer)"
+        role = "Demandeur principal" if normalize_matricule(r[1]) == normalize_matricule(r[2]) else "Binôme"
+        out.append({"Situation": situation, "Étape": etape, "Référence": f"STG-{int(r[0]):05d}", "Rôle": role,
+                    "Matricule": r[2], "Nom": r[3], "Prénom": r[4], "Promotion": r[5], "N° CCP": r[6] or "",
+                    "Entreprise": r[7], "Sujet du stage": r[8], "Enseignant superviseur": r[9],
+                    "Début": r[10], "Fin": r[11], "Date de soumission": r[12],
+                    "Avis du Vice-doyen": avis or "—", "Date de l'avis": r[16] or "", "Observation": r[17] or ""})
+    df = pd.DataFrame(out)
+    if not df.empty:
+        df["_o"] = df["Situation"].map({s: i for i, s in enumerate(SITUATION_ORDER)})
+        df = df.sort_values(["_o", "Référence"], ascending=[True, False], kind="stable").drop(columns="_o").reset_index(drop=True)
+    return df
+
+def dfs_to_excel_bytes(sheets):
+    """Classeur Excel multi-feuilles : {nom_de_feuille: DataFrame}."""
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        for name, df in sheets.items():
+            name = name[:31]
+            df.to_excel(writer, index=False, sheet_name=name)
+            ws = writer.sheets[name]
+            ws.freeze_panes = "A2"
+            for idx, col in enumerate(df.columns, 1):
+                longest = max([len(str(col))] + [len(str(v)) for v in df[col].tolist()])
+                ws.column_dimensions[ws.cell(row=1, column=idx).column_letter].width = min(max(12, longest + 2), 60)
+    return buf.getvalue()
+
 def admin_password():
     try: return st.secrets.get("ADMIN_PASSWORD", os.getenv("ADMIN_PASSWORD", ""))
     except Exception: return os.getenv("ADMIN_PASSWORD", "")
@@ -1308,6 +1362,30 @@ elif page == "Administration":
             approved_csv = approved_people_df.to_csv(index=False).encode("utf-8-sig")
             st.download_button("⬇️ Exporter la liste des avis favorables (CSV)", approved_csv,
                 "Demandeurs_avis_favorables_FGE_2026-2027.csv", "text/csv")
+
+        # Liste complète des demandeurs par situation (Excel)
+        st.markdown("### 📋 Liste des demandeurs de stage par situation (Excel)")
+        with sqlite3.connect(DB_FILE) as con_s:
+            situ_df = demandeurs_situation_df(con_s)
+        if situ_df.empty:
+            st.info("Aucune demande enregistrée.")
+        else:
+            counts = situ_df["Situation"].value_counts()
+            cols_s = st.columns(4)
+            for col_s, name_s in zip(cols_s, SITUATION_ORDER):
+                col_s.metric(name_s, int(counts.get(name_s, 0)))
+            chosen = st.multiselect("Situations à inclure dans le fichier", SITUATION_ORDER, default=SITUATION_ORDER,
+                                    key="admin_situations")
+            filtered = situ_df[situ_df["Situation"].isin(chosen)].reset_index(drop=True)
+            st.dataframe(filtered, use_container_width=True, hide_index=True)
+            if chosen:
+                sheets = {"Tous les demandeurs": filtered}
+                for name_s in chosen:
+                    sheets[name_s] = filtered[filtered["Situation"] == name_s].drop(columns=["Situation"]).reset_index(drop=True)
+                st.download_button("📊 Télécharger la liste des demandeurs (Excel)", dfs_to_excel_bytes(sheets),
+                                   "Liste_demandeurs_stage_avis_FGE_2026-2027.xlsx", XLSX_MIME, key="admin_excel_situations")
+            else:
+                st.info("Sélectionnez au moins une situation.")
 
         st.markdown("#### Autoriser exceptionnellement un nouveau dépôt")
         st.caption("Sélectionnez un bénéficiaire ayant déjà reçu un avis favorable. L'autorisation permet un seul nouveau dépôt et la plateforme affiche alors une mention rappelant l'avis favorable précédent.")
