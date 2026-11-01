@@ -285,6 +285,24 @@ def fix_stage_passage(doc, full_name, promotion):
         else:
             paragraph.text = new_text
 
+def fix_attestation_inscription(doc, promotion):
+    """Attestation de stage : « Inscrit (e) en <année> en vue de l'obtention du diplôme …, à la Faculté de Génie Electrique … »."""
+    passage = stage_passage_for_promotion(promotion).rstrip(".")
+    for paragraph in _iter_paragraphs(doc):
+        found = re.match(r"^(\s*)Inscrit\s*\(e\)\s+à la Faculté de Génie Electrique de l.Université de Sidi Bel Abbes(.*)$",
+                         paragraph.text, flags=re.S)
+        if not found:
+            continue
+        new_text = (f"{found.group(1)}Inscrit (e) {passage}, à la Faculté de Génie Electrique "
+                    f"de l’Université de Sidi Bel Abbes{found.group(2)}")
+        runs = paragraph.runs
+        if runs:
+            runs[0].text = new_text
+            for extra in runs[1:]:
+                extra.text = ""
+        else:
+            paragraph.text = new_text
+
 def build_three_stage_documents(request_data, student, nb_participants=1):
     """Remplit le modèle institutionnel (assiduité + convention + attestation) pour UN SEUL étudiant.
 
@@ -347,6 +365,7 @@ def build_three_stage_documents(request_data, student, nb_participants=1):
                     walk_paragraphs(cell)
     walk_paragraphs(doc)
     fix_stage_passage(doc, full_name, promotion)
+    fix_attestation_inscription(doc, promotion)
     out = io.BytesIO()
     doc.save(out)
     return out.getvalue()
