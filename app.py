@@ -691,7 +691,8 @@ def visites_export_df(con):
         "chef_observation","visite_date_generation","document_genere"]
     df = pd.DataFrame(rows, columns=columns)
     if df.empty:
-        return pd.DataFrame(columns=["Référence", "Date de dépôt", "Matricule", "Nom", "Prénom", "Promotion",
+        return pd.DataFrame(columns=["Référence", "Date de dépôt", "Matricule", "Nom", "Prénom",
+            "Nom (arabe)", "Prénom (arabe)", "Nom et prénom (arabe)", "Promotion",
             "Niveau", "Diplôme préparé", "Spécialité", "Date de naissance", "Lieu de naissance", "Téléphone",
             "E-mail", "Entreprise", "Wilaya de l'entreprise", "Début de visite", "Fin de visite", "Statut",
             "Avis du Chef de département", "Date de décision", "Observation du Chef", "Document Visite.docx généré le",
@@ -705,6 +706,19 @@ def visites_export_df(con):
         "statut":"Statut", "chef_avis":"Avis du Chef de département", "chef_avis_date":"Date de décision",
         "chef_observation":"Observation du Chef", "visite_date_generation":"Document Visite.docx généré le",
         "document_genere":"Document Word disponible"})
+    # Regrouper également les deux champs arabes dans une colonne immédiatement
+    # identifiable, sans supprimer les champs séparés de la base.
+    nom_arabe = df["Nom (arabe)"].fillna("").astype(str).str.strip()
+    prenom_arabe = df["Prénom (arabe)"].fillna("").astype(str).str.strip()
+    df["Nom et prénom (arabe)"] = (nom_arabe + " " + prenom_arabe).str.strip()
+    # Placer les informations arabes juste après le nom/prénom en caractères latins.
+    colonnes = list(df.columns)
+    for col in ["Nom (arabe)", "Prénom (arabe)", "Nom et prénom (arabe)"]:
+        if col in colonnes:
+            colonnes.remove(col)
+    insertion = colonnes.index("Prénom") + 1 if "Prénom" in colonnes else len(colonnes)
+    colonnes[insertion:insertion] = ["Nom (arabe)", "Prénom (arabe)", "Nom et prénom (arabe)"]
+    df = df[colonnes]
     df["Document Word disponible"] = df["Document Word disponible"].map(lambda v: "Oui" if bool(v) else "Non")
     return df.drop(columns=["id", "departement"], errors="ignore")
 
@@ -744,6 +758,11 @@ def df_to_excel_bytes(df, sheet_name="Demandes et avis"):
         for idx, col in enumerate(df.columns, 1):
             longest = max([len(str(col))] + [len(str(v)) for v in df[col].tolist()])
             ws.column_dimensions[ws.cell(row=1, column=idx).column_letter].width = min(max(12, longest + 2), 60)
+            if col in {"Nom (arabe)", "Prénom (arabe)", "Nom et prénom (arabe)"}:
+                from openpyxl.styles import Alignment
+                for row_idx in range(2, ws.max_row + 1):
+                    cell = ws.cell(row=row_idx, column=idx)
+                    cell.alignment = Alignment(horizontal="right", vertical="center", readingOrder=2, wrap_text=True)
     return buf.getvalue()
 
 XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
