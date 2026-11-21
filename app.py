@@ -98,6 +98,10 @@ def normalize_matricule(value):
 def norm_promo(value):
     return re.sub(r"\s+", "", clean_text(value).upper())
 
+def is_academic_leave(value):
+    """Reconnaît OUI dans la colonne source « Congé académique »."""
+    return clean_text(value).strip().upper() in {"OUI", "O", "YES", "TRUE", "1"}
+
 @st.cache_data
 def load_students(path, modified_time):
     df = pd.read_excel(path, sheet_name=SHEET_NAME, dtype=object)
@@ -133,6 +137,8 @@ def student_record(row):
         "telephone": first_value(row, "N° de téléphone"),
         "email": first_value(row, "E-mail institutionnel", "email"),
         "mat_bac": first_value(row, "Mat. BAC"),
+        "conge_academique": first_value(row, "Congé académique"),
+        "est_en_conge_academique": is_academic_leave(row.get("Congé académique", "")),
     }
 
 @st.cache_data
@@ -957,6 +963,10 @@ def stage_dashboard_data(students_df, db_path):
     fois un étudiant qui possède plusieurs lignes de demande.
     """
     eligible = students_df.copy()
+    # Les étudiants marqués OUI dans « Congé académique » sont exclus de
+    # tous les effectifs et exports d'éligibilité.
+    if "Congé académique" in eligible.columns:
+        eligible = eligible[~eligible["Congé académique"].apply(is_academic_leave)].copy()
     eligible["Promotion"] = eligible["Promotion"].apply(clean_text)
     eligible = eligible[eligible["Promotion"].apply(lambda x: norm_promo(x) in PROMOTIONS_STAGE_REMUNERE)].copy()
     eligible["Matricule"] = eligible["Mat. Etudiant"].apply(normalize_matricule)
@@ -1436,6 +1446,9 @@ if page == "Demande de stage":
         if found.empty: st.error("Matricule introuvable dans le fichier source.")
         else:
             main_student = student_record(found.iloc[0])
+            if main_student.get("est_en_conge_academique"):
+                st.error("⛔ Votre dossier indique un congé académique (Congé académique : OUI). Vous ne pouvez pas déposer une demande de stage ou de visite pendant cette période. Veuillez contacter l'administration si cette information est incorrecte.")
+                st.stop()
 
             # Mes demandes et l'avis rendu pour MOI (hors CCP) + export Excel.
             with sqlite3.connect(DB_FILE) as con_x:
@@ -1586,7 +1599,7 @@ if page == "Demande de stage":
                 # l'étudiant de déposer une demande de visite ou de stage non rémunéré.
 
     pending_request = None
-    if main_student and selected_stage_type in TYPES_DEMANDE_STAGE:
+    if main_student and not main_student.get("est_en_conge_academique") and selected_stage_type in TYPES_DEMANDE_STAGE:
         # Reprendre une demande inachevée OU une demande dont le Chef a autorisé la modification.
         with sqlite3.connect(DB_FILE) as con:
             row_pending = con.execute(
@@ -1655,6 +1668,9 @@ if page == "Demande de stage":
                 companion_errors.append(f"Matricule introuvable : {mk}")
                 continue
             record = student_record(match.iloc[0])
+            if record.get("est_en_conge_academique"):
+                companion_errors.append(f"{record['nom']} {record['prenom']} ({mk}) est en congé académique et ne peut pas participer à cette demande.")
+                continue
             saved_record = pending_by_matricule.get(mk)
             if saved_record:
                 record.update({k: v for k, v in saved_record.items() if k in record})
