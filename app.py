@@ -226,30 +226,114 @@ def date_fr_complete(d):
     return f"{JOURS_FR[d.weekday()]} {d.day} {mois[d.month-1]} {d.year}"
 
 def remplir_tableau_assiduite(doc, date_debut, date_fin):
+    """Remplit le formulaire 4 avec les seuls jours ouvrables (dimanche-jeudi).
+
+    Le tableau est redimensionné au nombre réel de journées du stage. Les lignes
+    vendredi/samedi ne sont jamais ajoutées. La mise en page est resserrée afin
+    de conserver l'attestation d'assiduité sur une seule page A4.
+    """
     try:
         debut = date.fromisoformat(str(date_debut)[:10])
         fin = date.fromisoformat(str(date_fin)[:10])
     except Exception:
         return
-    table = next((t for t in doc.tables if len(t.rows) >= 16 and len(t.columns) >= 3 and "Observation" in t.cell(0,2).text), None)
+    if fin < debut:
+        return
+
+    table = next((t for t in doc.tables
+                  if len(t.rows) >= 10 and len(t.columns) >= 3
+                  and any("Observation" in c.text for c in t.rows[0].cells)), None)
     if table is None:
         return
+
+    jours = []
     current = debut
-    for idx in range(1, min(16, len(table.rows))):
-        if current > fin:
-            table.cell(idx,1).text = "—"
-            table.cell(idx,2).text = "—"
-            continue
-        table.cell(idx,1).text = date_fr_complete(current)
-        holiday = FERIES_ALGERIE.get(current.isoformat())
-        if current.weekday() in (4,5):
-            label = "Vendredi" if current.weekday() == 4 else "Samedi"
-            table.cell(idx,2).text = f"Non comptabilisé — {label}"
-        elif holiday:
-            table.cell(idx,2).text = f"Non comptabilisé — {holiday}"
-        else:
-            table.cell(idx,2).text = ""
+    while current <= fin:
+        # En Algérie, vendredi (4) et samedi (5) ne sont pas des jours de stage.
+        if current.weekday() not in (4, 5):
+            jours.append(current)
         current += timedelta(days=1)
+
+    # La première ligne est l'en-tête. Dupliquer/supprimer les lignes de données
+    # permet d'avoir exactement une ligne par journée ouvrable.
+    from copy import deepcopy
+    while len(table.rows) - 1 < len(jours):
+        table._tbl.append(deepcopy(table.rows[-1]._tr))
+    while len(table.rows) - 1 > len(jours):
+        table._tbl.remove(table.rows[-1]._tr)
+
+    mois = ["janvier", "février", "mars", "avril", "mai", "juin",
+            "juillet", "août", "septembre", "octobre", "novembre", "décembre"]
+    ordinaux = lambda n: f"{n}er Jour" if n == 1 else f"{n}ème Jour"
+
+    # Réglages compacts de la table pour que son contenu reste sur une seule page.
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+    table.autofit = True
+    tbl_pr = table._tbl.tblPr
+    margins = tbl_pr.find(qn('w:tblCellMar'))
+    if margins is None:
+        margins = OxmlElement('w:tblCellMar')
+        tbl_pr.append(margins)
+    for side, value in (("top", "25"), ("bottom", "25"), ("start", "55"), ("end", "55")):
+        node = margins.find(qn(f'w:{side}'))
+        if node is None:
+            node = OxmlElement(f'w:{side}')
+            margins.append(node)
+        node.set(qn('w:w'), value)
+        node.set(qn('w:type'), 'dxa')
+
+    for idx, jour in enumerate(jours, start=1):
+        row = table.rows[idx]
+        row.cells[0].text = ordinaux(idx)
+        row.cells[1].text = f"{JOURS_FR[jour.weekday()]} {jour.day:02d}/{jour.month:02d}/{jour.year}"
+        # La colonne observation est volontairement vide pour l'entreprise d'accueil.
+        row.cells[2].text = ""
+        tr_pr = row._tr.get_or_add_trPr()
+        cant_split = OxmlElement('w:cantSplit')
+        tr_pr.append(cant_split)
+        for cell in row.cells:
+            for paragraph in cell.paragraphs:
+                paragraph.paragraph_format.space_before = Pt(0)
+                paragraph.paragraph_format.space_after = Pt(0)
+                paragraph.paragraph_format.line_spacing = 0.9
+                for run in paragraph.runs:
+                    run.font.size = Pt(7 if len(jours) > 12 else 8)
+
+    # Compacter la première page complète, y compris la zone de signature,
+    # pour empêcher que la signature et la mention Présent/Absent débordent.
+    if doc.sections:
+        first_section = doc.sections[0]
+        first_section.top_margin = Cm(0.35)
+        first_section.bottom_margin = Cm(0.30)
+        first_section.left_margin = Cm(1.0)
+        first_section.right_margin = Cm(1.0)
+    for paragraph in doc.paragraphs:
+        paragraph.paragraph_format.space_before = Pt(0)
+        paragraph.paragraph_format.space_after = Pt(0)
+        paragraph.paragraph_format.line_spacing = 0.88
+        ptxt = paragraph.text.strip().lower()
+        if "attestation d’assiduité" in ptxt or "attestation d'assiduité" in ptxt:
+            target_size = 14
+        elif ptxt.startswith(("1)", "2)", "3)")):
+            target_size = 9
+        else:
+            target_size = 8
+        for run in paragraph.runs:
+            if run.font.size is None or run.font.size.pt > target_size:
+                run.font.size = Pt(target_size)
+    # Réduire aussi les espacements de tous les paragraphes contenus dans
+    # les tableaux du formulaire (le tableau des coordonnées notamment).
+    for doc_table in doc.tables:
+        for doc_row in doc_table.rows:
+            for doc_cell in doc_row.cells:
+                for paragraph in doc_cell.paragraphs:
+                    paragraph.paragraph_format.space_before = Pt(0)
+                    paragraph.paragraph_format.space_after = Pt(0)
+                    paragraph.paragraph_format.line_spacing = 0.9
+                    for run in paragraph.runs:
+                        if run.font.size is None or run.font.size.pt > 8:
+                            run.font.size = Pt(8)
 
 ANNEES_FR = {"1": "première", "2": "deuxième", "3": "troisième", "4": "quatrième", "5": "cinquième"}
 SPECIALITES_INGENIEUR = {"EI": "électricité industrielle", "RSE": "réseaux et sources d'énergie"}
@@ -527,6 +611,7 @@ def init_db():
             "niveau": "TEXT", "diplome_prepare": "TEXT", "specialite": "TEXT",
             "visite_docx": "BLOB", "visite_date_generation": "TEXT",
             "chef_avis": "TEXT", "chef_avis_date": "TEXT", "chef_observation": "TEXT",
+            "signed_upload_date": "TEXT",
             # Masquage de l'affichage historique sans supprimer les décisions validées.
             "historique_efface": "INTEGER DEFAULT 0",
         }
@@ -667,7 +752,11 @@ def refresh_request_status(con, rid):
         statut, avis = (f"Avis rendus pour {n_done}/{total} étudiant(s) ({n_fav} favorable(s), "
                         f"{n_def} défavorable(s)) - En attente du Vice-doyen"), None
     elif n_docs > 0:
-        statut, avis = "Documents générés - En attente de l'avis du Vice-doyen", None
+        chef_state = con.execute("SELECT TRIM(COALESCE(chef_avis,'')) FROM demandes WHERE id=?", (rid,)).fetchone()
+        if not chef_state or chef_state[0] != AVIS_CHEF_FAV:
+            statut, avis = "En attente de l'avis du Chef de département", None
+        else:
+            statut, avis = "Documents générés - En attente de l'avis du Vice-doyen", None
     else:
         return
     con.execute("UPDATE demandes SET statut=?, vice_dean_avis=? WHERE id=?", (statut, avis, rid))
@@ -1182,10 +1271,27 @@ if page == "Demande de stage":
 
             # Historique global personnel : stages ET visites, avec statut du document signé.
             with sqlite3.connect(DB_FILE) as con_hist:
-                all_my_requests = pd.read_sql_query("""SELECT id, date_soumission, type_demande, entreprise,
-                    sujet_stage, date_debut, date_fin, statut, signed_pdf IS NOT NULL AS document_signe,
-                    chef_avis, chef_avis_date FROM demandes WHERE matricule=? ORDER BY id DESC""",
-                    con_hist, params=(main_student["matricule"],))
+                all_my_requests = pd.read_sql_query("""SELECT
+                    r.id AS reference_interne, r.date_soumission AS date_demande,
+                    r.departement, COALESCE(d.matricule, r.matricule) AS matricule,
+                    COALESCE(d.nom, r.nom) AS nom, COALESCE(d.prenom, r.prenom) AS prenom,
+                    r.nom_arabe, r.prenom_arabe, COALESCE(d.promotion, r.promotion) AS promotion,
+                    r.groupe, r.sous_groupe, r.telephone, r.email, r.wilaya_residence,
+                    r.date_naissance, r.lieu_naissance, r.ville_naissance, r.wilaya_naissance,
+                    r.type_demande, r.entreprise, r.secteur, r.adresse_entreprise,
+                    r.wilaya_entreprise, r.telephone_entreprise, r.email_entreprise,
+                    r.responsable, r.fonction_responsable, r.sujet_stage, r.domaine_stage,
+                    r.enseignant_superviseur, r.programme_stage, r.date_debut, r.date_fin,
+                    r.observations, r.statut, (r.signed_pdf IS NOT NULL) AS document_signe,
+                    r.signed_upload_date AS date_televersement_document_signe,
+                    r.chef_avis AS avis_chef_departement,
+                    r.chef_avis_date AS date_avis_chef_departement,
+                    r.chef_observation AS observation_chef_departement
+                    FROM demandes r LEFT JOIN dossiers_etudiants d
+                      ON d.demande_id=r.id AND d.matricule_key=?
+                    WHERE r.matricule=? OR d.matricule_key=? ORDER BY r.id DESC""",
+                    con_hist, params=(normalize_matricule(main_student["matricule"]),
+                                      main_student["matricule"], normalize_matricule(main_student["matricule"])))
             if not all_my_requests.empty:
                 with st.expander("🗂️ Historique complet de mes demandes (stages et visites)"):
                     st.dataframe(all_my_requests, use_container_width=True, hide_index=True)
@@ -1567,13 +1673,13 @@ if page == "Demande de stage":
                             st.error("Le fichier téléversé ne semble pas être un PDF valide.")
                         else:
                             with sqlite3.connect(DB_FILE) as con:
-                                con.execute("UPDATE demandes SET signed_pdf=?, statut=? WHERE id=?",
-                                            (sqlite3.Binary(content),"Transmise au Chef de département",active_id))
+                                con.execute("UPDATE demandes SET signed_pdf=?, signed_upload_date=?, statut=? WHERE id=?",
+                                            (sqlite3.Binary(content), datetime.now().isoformat(timespec="seconds"), "En attente de l’avis du Chef de département", active_id))
                                 con.commit()
                             st.session_state.pop("active_request_id",None)
                             st.session_state.pop("active_pdf",None)
                             st.success(f"Demande {reference_demande(active_id, selected_stage_type)} transmise au Chef de département.")
-                            st.info("Le statut de votre demande est désormais : Transmise au Chef de département.")
+                            st.info("Votre demande signée est enregistrée et reste en attente de l’avis du Chef de département. Elle est visible dans les espaces Étudiant, Chef de département, Vice-doyen et Administration.")
     elif main_student and selected_stage_type == "Visite en entreprise":
         st.markdown('<div class="section">2. Demande de visite en entreprise</div>', unsafe_allow_html=True)
         st.info("Votre demande est traitée comme une visite en entreprise. Le document officiel Visite.docx sera généré automatiquement dès l'envoi.")
@@ -1663,8 +1769,8 @@ if page == "Demande de stage":
                     st.error("Le fichier téléversé ne semble pas être un PDF valide.")
                 elif st.button("📨 Déposer le document de visite signé", type="primary", key=f"submit_signed_visit_{visit_id}"):
                     with sqlite3.connect(DB_FILE) as con:
-                        con.execute("UPDATE demandes SET signed_pdf=?, statut=? WHERE id=? AND type_demande='Visite en entreprise'",
-                            (sqlite3.Binary(signed_visit.getvalue()), "Document de visite signé déposé — en attente du Chef de département", visit_id))
+                        con.execute("UPDATE demandes SET signed_pdf=?, signed_upload_date=?, statut=? WHERE id=? AND type_demande='Visite en entreprise'",
+                            (sqlite3.Binary(signed_visit.getvalue()), datetime.now().isoformat(timespec="seconds"), "Document de visite signé déposé — en attente de l’avis du Chef de département", visit_id))
                         con.commit()
                     st.success("Le document signé a été déposé. Il est maintenant visible dans l'historique des espaces administratifs.")
                     st.rerun()
@@ -1679,7 +1785,7 @@ elif page == "Administration":
         with sqlite3.connect(DB_FILE) as con:
             data = pd.read_sql_query("""SELECT id,date_soumission,departement,matricule,nom,prenom,nom_arabe,prenom_arabe,promotion,
                 wilaya_residence,ville_naissance,wilaya_naissance,date_naissance,lieu_naissance,enseignant_superviseur,programme_stage,
-                entreprise,sujet_stage,type_demande,statut,participants_json FROM demandes ORDER BY id DESC""",con)
+                entreprise,sujet_stage,type_demande,statut,signed_upload_date,chef_avis,chef_avis_date,participants_json FROM demandes ORDER BY id DESC""",con)
         st.metric("Nombre total de demandes",len(data))
         st.caption("Historique global : toutes les demandes enregistrées (stages et visites), y compris celles dont le document signé n'a pas encore été téléversé.")
 
@@ -1913,7 +2019,15 @@ elif page == "Chef de département":
             con.commit()
             chef_data = pd.read_sql_query("SELECT id, date_soumission, matricule, nom, prenom, entreprise, sujet_stage, statut, type_demande FROM demandes WHERE type_demande IN ('Stage rémunéré','Stage non rémunéré') ORDER BY id DESC", con)
         with sqlite3.connect(DB_FILE) as con_hist_chef:
-            chef_history = pd.read_sql_query("SELECT id, date_soumission, matricule, nom, prenom, promotion, type_demande, entreprise, date_debut, date_fin, statut, signed_pdf IS NOT NULL AS document_signe, chef_avis, chef_avis_date FROM demandes ORDER BY id DESC", con_hist_chef)
+            chef_history = pd.read_sql_query("""SELECT id AS reference_interne, date_soumission AS date_demande,
+                departement, matricule, nom, prenom, nom_arabe, prenom_arabe, promotion, groupe, sous_groupe,
+                telephone, email, wilaya_residence, date_naissance, lieu_naissance, ville_naissance, wilaya_naissance,
+                type_demande, entreprise, secteur, adresse_entreprise, wilaya_entreprise, telephone_entreprise,
+                email_entreprise, responsable, fonction_responsable, sujet_stage, domaine_stage,
+                enseignant_superviseur, programme_stage, date_debut, date_fin, observations, statut,
+                signed_pdf IS NOT NULL AS document_signe, signed_upload_date AS date_televersement_document_signe,
+                chef_avis AS avis_chef_departement, chef_avis_date AS date_avis_chef_departement,
+                chef_observation AS observation_chef_departement FROM demandes ORDER BY id DESC""", con_hist_chef)
         st.markdown("### 🗂️ Historique complet des demandeurs — stages et visites")
         st.dataframe(chef_history, use_container_width=True, hide_index=True)
         st.download_button("📊 Télécharger l'historique complet (Excel)", df_to_excel_bytes(chef_history, "Historique complet"),
@@ -1939,6 +2053,27 @@ elif page == "Chef de département":
                 st.download_button("Télécharger la demande signée par l'étudiant", bytes(rec["signed_pdf"]),
                                    f"Demande_signee_{reference_demande(selected_chef, rec.get('type_demande'))}.pdf", "application/pdf",
                                    key=f"chef_signed_{selected_chef}")
+                st.caption(f"Document signé téléversé le : {rec.get('signed_upload_date') or 'Date non renseignée'}")
+                avis_stage_chef = (rec.get("chef_avis") or "").strip()
+                if avis_stage_chef == AVIS_CHEF_FAV:
+                    st.success(f"Avis favorable du Chef de département enregistré le {rec.get('chef_avis_date') or '—'}.")
+                elif avis_stage_chef == AVIS_CHEF_DEF:
+                    st.error(f"Avis défavorable du Chef de département enregistré le {rec.get('chef_avis_date') or '—'}.")
+                observation_stage_chef = st.text_area("Observation du Chef de département", value=rec.get("chef_observation") or "", key=f"chef_stage_comment_{selected_chef}")
+                cs1, cs2 = st.columns(2)
+                stage_chef_fav = cs1.button("✅ Avis favorable du Chef", type="primary", key=f"chef_stage_fav_{selected_chef}", use_container_width=True)
+                stage_chef_def = cs2.button("❌ Avis défavorable du Chef", key=f"chef_stage_def_{selected_chef}", use_container_width=True)
+                if stage_chef_fav or stage_chef_def:
+                    decision_chef = AVIS_CHEF_FAV if stage_chef_fav else AVIS_CHEF_DEF
+                    date_decision_chef = datetime.now().isoformat(timespec="seconds")
+                    statut_chef = ("Avis favorable du Chef de département — en attente du Vice-doyen" if stage_chef_fav
+                                   else "Avis défavorable du Chef de département")
+                    with sqlite3.connect(DB_FILE) as con_dec:
+                        con_dec.execute("UPDATE demandes SET chef_avis=?, chef_avis_date=?, chef_observation=?, statut=? WHERE id=?",
+                                        (decision_chef, date_decision_chef, observation_stage_chef.strip(), statut_chef, selected_chef))
+                        con_dec.commit()
+                    st.success("Avis du Chef de département enregistré dans l'historique partagé.")
+                    st.rerun()
                 st.markdown("### Dossiers individuels des étudiants")
                 st.caption("Chaque étudiant a son propre CCP, son propre chèque barré et ses propres documents "
                            "(Attestation d’Assiduité, Convention de Stage, Attestation de Stage), remplis avec ses informations personnelles.")
@@ -2103,7 +2238,8 @@ elif page == "Vice-doyen":
             vd_data = pd.read_sql_query("""SELECT d.id AS dossier_id, d.demande_id, d.matricule, d.nom, d.prenom,
                 d.documents_date, d.vice_dean_avis, d.vice_dean_comment, r.entreprise, r.statut, r.type_demande
                 FROM dossiers_etudiants d JOIN demandes r ON r.id = d.demande_id
-                WHERE d.documents_docx IS NOT NULL
+                WHERE d.documents_docx IS NOT NULL AND COALESCE(r.chef_avis, '') = 'Avis favorable'
+                  AND COALESCE(r.type_demande, '') IN ('Stage rémunéré','Stage non rémunéré')
                 ORDER BY d.demande_id DESC, d.id""", con)
         flash_vd = st.session_state.pop("vd_flash", None)
         if flash_vd:
@@ -2114,7 +2250,15 @@ elif page == "Vice-doyen":
             st.download_button("📊 Excel — dossiers par étudiant et leur avis", df_to_excel_bytes(vd_df),
                                "Dossiers_et_avis_FGE_2026-2027.xlsx", XLSX_MIME, key="vd_excel")
         with sqlite3.connect(DB_FILE) as con_hist_vd:
-            vd_history = pd.read_sql_query("SELECT id, date_soumission, matricule, nom, prenom, promotion, type_demande, entreprise, date_debut, date_fin, statut, signed_pdf IS NOT NULL AS document_signe, chef_avis, chef_avis_date FROM demandes ORDER BY id DESC", con_hist_vd)
+            vd_history = pd.read_sql_query("""SELECT id AS reference_interne, date_soumission AS date_demande,
+                departement, matricule, nom, prenom, nom_arabe, prenom_arabe, promotion, groupe, sous_groupe,
+                telephone, email, wilaya_residence, date_naissance, lieu_naissance, ville_naissance, wilaya_naissance,
+                type_demande, entreprise, secteur, adresse_entreprise, wilaya_entreprise, telephone_entreprise,
+                email_entreprise, responsable, fonction_responsable, sujet_stage, domaine_stage,
+                enseignant_superviseur, programme_stage, date_debut, date_fin, observations, statut,
+                signed_pdf IS NOT NULL AS document_signe, signed_upload_date AS date_televersement_document_signe,
+                chef_avis AS avis_chef_departement, chef_avis_date AS date_avis_chef_departement,
+                chef_observation AS observation_chef_departement FROM demandes ORDER BY id DESC""", con_hist_vd)
         st.markdown("### 🗂️ Historique complet des demandeurs — stages et visites")
         st.dataframe(vd_history, use_container_width=True, hide_index=True)
         st.download_button("📊 Télécharger l'historique complet (Excel)", df_to_excel_bytes(vd_history, "Historique complet"),
