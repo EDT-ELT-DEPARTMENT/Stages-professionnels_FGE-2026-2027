@@ -949,6 +949,161 @@ def dfs_to_excel_bytes(sheets):
                 ws.column_dimensions[ws.cell(row=1, column=idx).column_letter].width = min(max(12, longest + 2), 60)
     return buf.getvalue()
 
+def stage_dashboard_data(students_df, db_path):
+    """Construit les indicateurs à partir du fichier étudiant et des demandes enregistrées.
+
+    Les effectifs éligibles proviennent du fichier source officiel. Les demandeurs et
+    avis sont comptés par matricule du demandeur principal, sans compter plusieurs
+    fois un étudiant qui possède plusieurs lignes de demande.
+    """
+    eligible = students_df.copy()
+    eligible["Promotion"] = eligible["Promotion"].apply(clean_text)
+    eligible = eligible[eligible["Promotion"].apply(lambda x: norm_promo(x) in PROMOTIONS_STAGE_REMUNERE)].copy()
+    eligible["Matricule"] = eligible["Mat. Etudiant"].apply(normalize_matricule)
+    eligible["Nom"] = eligible["Nom"].apply(clean_text)
+    eligible["Prénom"] = eligible["Prénom"].apply(clean_text)
+    eligible = eligible.drop_duplicates("Matricule")
+    eligible["Département"] = DEPARTEMENT_ACTUEL
+
+    try:
+        with sqlite3.connect(db_path) as con:
+            requests = pd.read_sql_query("""SELECT id, matricule, nom, prenom, promotion, type_demande,
+                date_soumission, statut, chef_avis, chef_avis_date, signed_upload_date, participants_json
+                FROM demandes ORDER BY id DESC""", con)
+    except Exception:
+        requests = pd.DataFrame(columns=["id", "matricule", "nom", "prenom", "promotion", "type_demande", "date_soumission", "statut", "chef_avis", "chef_avis_date", "signed_upload_date"])
+
+    if not requests.empty:
+        # Déplier aussi les camarades déclarés dans participants_json : les
+        # statistiques comptent chaque étudiant du groupe, pas seulement le principal.
+        expanded_rows = []
+        for _, req in requests.iterrows():
+            base = req.to_dict()
+            expanded_rows.append(base)
+            try:
+                companions = json.loads(base.get("participants_json") or "[]")
+            except Exception:
+                companions = []
+            if isinstance(companions, list):
+                for participant in companions:
+                    if not isinstance(participant, dict):
+                        continue
+                    participant_row = dict(base)
+                    participant_row["matricule"] = participant.get("matricule", "")
+                    participant_row["nom"] = participant.get("nom", "")
+                    participant_row["prenom"] = participant.get("prenom", "")
+                    participant_row["promotion"] = participant.get("promotion", base.get("promotion", ""))
+                    expanded_rows.append(participant_row)
+        requests = pd.DataFrame(expanded_rows)
+        requests["_mat"] = requests["matricule"].apply(normalize_matricule)
+        requests["type_demande"] = requests["type_demande"].fillna("").astype(str).str.strip()
+        requests = requests[requests["_mat"] != ""].drop_duplicates(subset=["id", "_mat"])
+        remunerated = requests[requests["type_demande"].eq("Stage rémunéré")].copy()
+        nonrem = requests[requests["type_demande"].eq("Stage non rémunéré")].copy()
+        visits = requests[requests["type_demande"].str.contains("visite", case=False, na=False)].copy()
+        favorable = remunerated[remunerated["chef_avis"].fillna("").astype(str).str.strip().eq(AVIS_CHEF_FAV)]
+        remunerated_mats = set(remunerated["_mat"].dropna()) - {""}
+        favorable_mats = set(favorable["_mat"].dropna()) - {""}
+        nonrem_mats = set(nonrem["_mat"].dropna()) - {""}
+        visit_mats = set(visits["_mat"].dropna()) - {""}
+    else:
+        remunerated = nonrem = visits = favorable = requests.copy()
+        remunerated_mats = favorable_mats = nonrem_mats = visit_mats = set()
+
+    total_eligible = int(eligible["Matricule"].nunique())
+    favorable_count = len(favorable_mats)
+    favorable_pct = (100.0 * favorable_count / total_eligible) if total_eligible else 0.0
+    indicators = pd.DataFrame([
+        {"Indicateur": "Étudiants éligibles au stage rémunéré", "Nombre": total_eligible},
+        {"Indicateur": "Demandeurs principaux — stage rémunéré", "Nombre": len(remunerated_mats)},
+        {"Indicateur": "Avis favorables du Chef — stage rémunéré", "Nombre": favorable_count},
+        {"Indicateur": "Pourcentage favorable / total éligible rémunéré", "Nombre": favorable_pct, "Unité": "%"},
+        {"Indicateur": "Demandeurs principaux — stage non rémunéré", "Nombre": len(nonrem_mats)},
+        {"Indicateur": "Demandeurs principaux — visite en entreprise", "Nombre": len(visit_mats)},
+    ])
+    by_promo = eligible.groupby("Promotion", dropna=False).agg(
+        **{"Nombre d'étudiants éligibles": ("Matricule", "nunique")}
+    ).reset_index().sort_values("Promotion")
+    request_promo_rows = []
+    for promo in sorted(eligible["Promotion"].dropna().unique(), key=str):
+        promo_norm = norm_promo(promo)
+        p_req = remunerated[remunerated["promotion"].apply(norm_promo).eq(promo_norm)] if not remunerated.empty else remunerated
+        p_fav = favorable[favorable["promotion"].apply(norm_promo).eq(promo_norm)] if not favorable.empty else favorable
+        eligible_n = int(eligible[eligible["Promotion"].apply(norm_promo).eq(promo_norm)]["Matricule"].nunique())
+        fav_n = int(p_fav["_mat"].nunique()) if not p_fav.empty else 0
+        request_promo_rows.append({"Promotion": promo, "Étudiants éligibles": eligible_n,
+            "Demandeurs stage rémunéré": int(p_req["_mat"].nunique()) if not p_req.empty else 0,
+            "Avis favorables Chef": fav_n,
+            "Pourcentage favorable / éligibles": round(100 * fav_n / eligible_n, 2) if eligible_n else 0.0})
+    by_promo = pd.DataFrame(request_promo_rows)
+
+    def list_export(frame, label):
+        if frame.empty: return pd.DataFrame(columns=["Matricule", "Nom", "Prénom", "Promotion", "Date de demande", "Avis Chef", "Date avis Chef"])
+        out = frame.drop_duplicates("_mat", keep="first").copy()
+        return pd.DataFrame({"Matricule": out["matricule"], "Nom": out["nom"], "Prénom": out["prenom"],
+            "Promotion": out["promotion"], "Date de demande": out["date_soumission"],
+            "Avis Chef": out["chef_avis"], "Date avis Chef": out["chef_avis_date"]})
+
+    return eligible, indicators, by_promo, list_export(remunerated, "Stage rémunéré"), list_export(nonrem, "Stage non rémunéré"), list_export(visits, "Visite"), favorable_pct, favorable_count, total_eligible, len(nonrem_mats), len(visit_mats)
+
+
+def render_stage_dashboard(students_df, db_path, prefix):
+    eligible, indicators, by_promo, remunerated_list, nonrem_list, visits_list, pct, fav_n, total_n, nonrem_n, visits_n = stage_dashboard_data(students_df, db_path)
+    st.markdown("### 📊 Tableau de bord — stages et visites")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Étudiants éligibles au stage rémunéré", f"{total_n:,}".replace(",", " "))
+    c2.metric("Avis favorables — stage rémunéré", f"{fav_n:,}".replace(",", " "))
+    c3.metric("Taux favorable / éligibles", f"{pct:.2f} %")
+    c4.metric("Stages non rémunérés", f"{nonrem_n:,}".replace(",", " "))
+    c5, c6 = st.columns(2)
+    c5.metric("Visites en entreprise", f"{visits_n:,}".replace(",", " "))
+    c6.metric("Demandeurs de stage rémunéré", f"{int(remunerated_list['Matricule'].nunique()) if not remunerated_list.empty else 0:,}".replace(",", " "))
+    st.markdown("#### 🎓 Étudiants éligibles au stage rémunéré par promotion")
+    st.dataframe(by_promo.style.format({"Pourcentage favorable / éligibles": "{:.2f} %"}).background_gradient(subset=["Étudiants éligibles", "Demandeurs stage rémunéré", "Avis favorables Chef"], cmap="Blues").background_gradient(subset=["Pourcentage favorable / éligibles"], cmap="Greens"), use_container_width=True, hide_index=True)
+    st.caption("Le pourcentage est calculé uniquement pour les stages rémunérés : nombre de demandeurs ayant reçu un avis favorable du Chef de département ÷ nombre total d'étudiants éligibles dans le fichier source × 100. Les effectifs de demandeurs comptent les matricules distincts des demandeurs principaux et des camarades associés à une demande.")
+    promo_sheets = {}
+    for promo, part in eligible.groupby("Promotion", dropna=False):
+        promo_sheets[("Promotion " + str(promo))[:31]] = part[["Matricule", "Nom", "Prénom", "Promotion", "Département"]].sort_values(["Nom", "Prénom"])
+    sheets = {"Indicateurs": indicators, "Synthèse promotions": by_promo,
+        "Tous les éligibles": eligible[["Matricule", "Nom", "Prénom", "Promotion", "Département"]].sort_values(["Promotion", "Nom", "Prénom"]),
+        "Stages rémunérés": remunerated_list, "Stages non rémunérés": nonrem_list, "Visites": visits_list}
+    sheets.update(promo_sheets)
+    st.download_button("📥 Télécharger les étudiants éligibles et les statistiques (Excel)",
+        data=colored_dashboard_excel(sheets), file_name="Tableau_de_bord_stages_FGE_2026-2027.xlsx",
+        mime=XLSX_MIME, key=f"{prefix}_dashboard_excel")
+
+
+def colored_dashboard_excel(sheets):
+    """Produit un classeur Excel avec titres, chiffres et tableaux colorés."""
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        for name, df in sheets.items():
+            safe_name = str(name)[:31]
+            df.to_excel(writer, index=False, sheet_name=safe_name)
+            ws = writer.sheets[safe_name]
+            ws.freeze_panes = "A2"
+            ws.auto_filter.ref = ws.dimensions
+            for cell in ws[1]:
+                cell.fill = PatternFill("solid", fgColor="16456B")
+                cell.font = Font(name="Calibri", bold=True, color="FFFFFF", size=11)
+                cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+            ws.row_dimensions[1].height = 30
+            for row in ws.iter_rows(min_row=2):
+                for cell in row:
+                    cell.alignment = Alignment(vertical="center", wrap_text=True)
+                    if cell.row % 2 == 0:
+                        cell.fill = PatternFill("solid", fgColor="EAF2F8")
+                    if isinstance(cell.value, (int, float)):
+                        cell.font = Font(bold=True, color="16456B")
+                        cell.number_format = '#,##0.00' if isinstance(cell.value, float) and not cell.value.is_integer() else '#,##0'
+            for idx, col in enumerate(df.columns, 1):
+                vals = [str(v) for v in df[col].dropna().head(300).tolist()]
+                longest = max([len(str(col))] + [len(v) for v in vals])
+                ws.column_dimensions[ws.cell(row=1, column=idx).column_letter].width = min(max(14, longest + 2), 42)
+            ws.sheet_view.showGridLines = False
+    return buf.getvalue()
+
 def admin_password():
     try: return st.secrets.get("ADMIN_PASSWORD", os.getenv("ADMIN_PASSWORD", ""))
     except Exception: return os.getenv("ADMIN_PASSWORD", "")
@@ -1873,6 +2028,8 @@ elif page == "Administration":
     if not expected:
         st.warning("Configurez ADMIN_PASSWORD dans les secrets Streamlit.")
     elif pwd and pwd == expected:
+        render_stage_dashboard(students, DB_FILE, "admin")
+        st.divider()
         with sqlite3.connect(DB_FILE) as con:
             data = pd.read_sql_query("""SELECT id,date_soumission,departement,matricule,nom,prenom,nom_arabe,prenom_arabe,promotion,
                 wilaya_residence,ville_naissance,wilaya_naissance,date_naissance,lieu_naissance,enseignant_superviseur,programme_stage,
@@ -2111,6 +2268,8 @@ elif page == "Chef de département":
     except Exception:
         expected_chef = os.getenv("CHEF_DEPT_PASSWORD", admin_password())
     if pwd_chef and pwd_chef == expected_chef:
+        render_stage_dashboard(students, DB_FILE, "chef")
+        st.divider()
         with sqlite3.connect(DB_FILE) as con:
             ensure_all_dossiers(con)
             con.commit()
@@ -2359,6 +2518,8 @@ elif page == "Vice-doyen":
     if not expected_vd:
         st.warning("Configurez VICE_DEAN_PASSWORD dans les secrets Streamlit pour activer cet espace.")
     elif pwd_vd and pwd_vd == expected_vd:
+        render_stage_dashboard(students, DB_FILE, "vice_dean")
+        st.divider()
         with sqlite3.connect(DB_FILE) as con:
             ensure_all_dossiers(con)
             con.commit()
