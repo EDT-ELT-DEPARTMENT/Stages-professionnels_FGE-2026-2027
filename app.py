@@ -617,6 +617,27 @@ def init_db():
         }
         for col, typ in migrations.items():
             if col not in cols: con.execute(f"ALTER TABLE demandes ADD COLUMN {col} {typ}")
+        # Autorisations ponctuelles de modification après dépôt / avis du Chef.
+        con.execute("""CREATE TABLE IF NOT EXISTS autorisations_modification (
+            demande_id INTEGER PRIMARY KEY,
+            matricule_key TEXT NOT NULL,
+            autorise_le TEXT NOT NULL,
+            autorise_par TEXT DEFAULT 'Chef de département',
+            motif TEXT DEFAULT ''
+        )""")
+        # Journal d'audit : chaque modification et chaque autorisation reste traçable.
+        con.execute("""CREATE TABLE IF NOT EXISTS historique_evenements (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            demande_id INTEGER NOT NULL,
+            matricule TEXT,
+            nom TEXT,
+            prenom TEXT,
+            evenement TEXT NOT NULL,
+            date_evenement TEXT NOT NULL,
+            auteur TEXT DEFAULT '',
+            avis_associe TEXT DEFAULT '',
+            details TEXT DEFAULT ''
+        )""")
         # Dérogation nominative et à usage unique après un avis favorable.
         con.execute("""CREATE TABLE IF NOT EXISTS autorisations_nouveau_stage (
             matricule_key TEXT PRIMARY KEY,
@@ -721,7 +742,7 @@ def favorable_dossiers_for(con, matricule_key):
             d.vice_dean_comment AS vice_dean_comment, r.statut AS statut
         FROM dossiers_etudiants d JOIN demandes r ON r.id = d.demande_id
         WHERE d.matricule_key = ? AND TRIM(COALESCE(d.vice_dean_avis, '')) = 'Avis favorable'
-          AND COALESCE(r.type_demande, 'Stage rémunéré') IN ('Stage rémunéré','Stage non rémunéré')
+          AND COALESCE(r.type_demande, 'Stage rémunéré') = 'Stage rémunéré'
         ORDER BY d.id DESC""", (matricule_key,))
     cols = [c[0] for c in cur.description]
     return [dict(zip(cols, row)) for row in cur.fetchall()]
@@ -1299,6 +1320,28 @@ if page == "Demande de stage":
                         df_to_excel_bytes(all_my_requests, "Mon historique"),
                         f"Historique_demandes_{normalize_matricule(main_student['matricule'])}.xlsx",
                         XLSX_MIME, key=f"student_all_history_{normalize_matricule(main_student['matricule'])}")
+            # Le demandeur peut retrouver et télécharger à nouveau son dernier document signé.
+            with sqlite3.connect(DB_FILE) as con_signed_student:
+                last_signed = con_signed_student.execute("""SELECT id,type_demande,signed_pdf,signed_upload_date,statut
+                    FROM demandes WHERE matricule=? AND signed_pdf IS NOT NULL ORDER BY id DESC LIMIT 1""",
+                    (normalize_matricule(main_student["matricule"]),)).fetchone()
+                student_events = pd.read_sql_query("""SELECT demande_id AS reference_interne, evenement,
+                    date_evenement, auteur, avis_associe, details FROM historique_evenements
+                    WHERE matricule=? ORDER BY date_evenement DESC""", con_signed_student,
+                    params=(main_student["matricule"],))
+            if last_signed:
+                st.markdown("### 📥 Mon dernier document signé")
+                st.caption(f"{reference_demande(last_signed[0], last_signed[1])} — téléversé le {last_signed[3] or '—'} — {last_signed[4] or '—'}")
+                st.download_button("⬇️ Télécharger à nouveau mon document signé", bytes(last_signed[2]),
+                    f"Document_signe_{reference_demande(last_signed[0], last_signed[1])}.pdf", "application/pdf",
+                    key=f"student_redownload_signed_{last_signed[0]}")
+            if not student_events.empty:
+                with st.expander("🕘 Historique de mes modifications et avis"):
+                    st.dataframe(student_events, use_container_width=True, hide_index=True)
+                    st.download_button("📥 Télécharger mon journal des modifications (Excel)",
+                        df_to_excel_bytes(student_events, "Mes modifications"),
+                        f"Journal_modifications_{normalize_matricule(main_student['matricule'])}.xlsx", XLSX_MIME,
+                        key=f"student_events_{normalize_matricule(main_student['matricule'])}")
 
             # Blocage INDIVIDUEL : seul l'étudiant ayant lui-même reçu un avis favorable est bloqué.
             # Le co-stagiaire d'un binôme n'est pas concerné tant que son propre dossier n'a pas d'avis favorable.
@@ -1309,6 +1352,7 @@ if page == "Demande de stage":
                     (matricule_key,)
                 ).fetchone() is not None
                 favorable_previous_requests = favorable_dossiers_for(con, matricule_key)
+                edit_authorized_any = con.execute("SELECT 1 FROM autorisations_modification a JOIN demandes r ON r.id=a.demande_id WHERE a.matricule_key=? AND r.type_demande IN ('Stage rémunéré','Stage non rémunéré') LIMIT 1", (matricule_key,)).fetchone() is not None
                 # Demande en cours (document signé pas encore déposé) : l'étudiant doit pouvoir la terminer.
                 open_pending = con.execute(
                     "SELECT 1 FROM demandes WHERE matricule=? AND COALESCE(type_demande,'Stage rémunéré')='Stage rémunéré' "
@@ -1316,7 +1360,7 @@ if page == "Demande de stage":
                 ).fetchone() is not None
 
             if (norm_promo(main_student["promotion"]) in PROMOTIONS_STAGE_REMUNERE
-                    and favorable_previous_requests and not reapply_authorized and not open_pending):
+                    and favorable_previous_requests and not reapply_authorized and not open_pending and not edit_authorized_any):
                 previous = favorable_previous_requests[0]
                 st.error(
                     "⛔ Un avis favorable a déjà été accordé pour ce matricule. "
@@ -1359,20 +1403,19 @@ if page == "Demande de stage":
                     horizontal=True,
                     key=f"type_demande_non_eligible_{normalize_matricule(main_student['matricule'])}"
                 )
-                if (selected_stage_type == "Stage non rémunéré" and favorable_previous_requests
-                        and not reapply_authorized):
-                    previous = favorable_previous_requests[0]
-                    st.error("⛔ Un avis favorable a déjà été accordé pour une demande de stage de ce matricule. Le dépôt d'une nouvelle demande de stage non rémunéré est bloqué.")
-                    st.warning(f"Dossier précédent : {reference_demande(previous['id'], 'Stage non rémunéré')} — {previous.get('entreprise') or 'Organisme non renseigné'} — avis du {previous.get('vice_dean_date') or 'date non renseignée'}.")
-                    st.info("Si une nouvelle demande est exceptionnellement autorisée, l'administration peut utiliser la procédure de dérogation à usage unique.")
-                    st.stop()
+                # Une décision favorable antérieure pour un stage rémunéré n'empêche pas
+                # l'étudiant de déposer une demande de visite ou de stage non rémunéré.
 
     pending_request = None
     if main_student and selected_stage_type in TYPES_DEMANDE_STAGE:
-        # Reprendre la dernière demande envoyée mais dont le document signé manque.
+        # Reprendre une demande inachevée OU une demande dont le Chef a autorisé la modification.
         with sqlite3.connect(DB_FILE) as con:
             row_pending = con.execute(
-                "SELECT * FROM demandes WHERE matricule=? AND type_demande=? AND signed_pdf IS NULL ORDER BY id DESC LIMIT 1",
+                """SELECT r.* FROM demandes r
+                   LEFT JOIN autorisations_modification a ON a.demande_id=r.id
+                   WHERE r.matricule=? AND r.type_demande=?
+                     AND (r.signed_pdf IS NULL OR a.demande_id IS NOT NULL)
+                   ORDER BY CASE WHEN a.demande_id IS NOT NULL THEN 0 ELSE 1 END, r.id DESC LIMIT 1""",
                 (normalize_matricule(main_student["matricule"]), selected_stage_type)
             ).fetchone()
             if row_pending:
@@ -1387,8 +1430,12 @@ if page == "Demande de stage":
                                         (pending_request["id"],)):
                     saved_dossiers[r_sd[0]] = {"ccp_number": r_sd[1] or "", "has_cheque": bool(r_sd[2])}
         if pending_request:
-            st.info(f"Une demande existe déjà pour votre matricule (référence {reference_demande(pending_request['id'], selected_stage_type)}). "
-                    "Son document signé n'a pas encore été déposé. Vos informations sont reprises ci-dessous : vous pouvez les modifier et régénérer le formulaire.")
+            with sqlite3.connect(DB_FILE) as con_auth:
+                edit_auth = con_auth.execute("SELECT autorise_le, motif FROM autorisations_modification WHERE demande_id=?", (pending_request['id'],)).fetchone()
+            if pending_request.get("signed_pdf") and edit_auth:
+                st.warning(f"✏️ Le Chef de département vous a autorisé à modifier cette demande le {edit_auth[0]}. Après modification, vous devrez générer et téléverser à nouveau le document signé.")
+            else:
+                st.info(f"Une demande existe déjà pour votre matricule (référence {reference_demande(pending_request['id'], selected_stage_type)}). Son document signé n'a pas encore été déposé. Vos informations sont reprises ci-dessous : vous pouvez les modifier et régénérer le formulaire.")
         with st.container(border=True):
             st.markdown("**Coordonnées du demandeur principal (issues du fichier source)**")
             st.write(f"**{main_student['nom']} {main_student['prenom']}** — {main_student['matricule']}")
@@ -1485,15 +1532,13 @@ if page == "Demande de stage":
         with st.form("stage_group_form"):
             c1,c2 = st.columns(2)
             entreprise = c1.text_input("Nom de l'entreprise *", value=(pending_request or {}).get("entreprise", ""))
-            secteur = c2.text_input("Secteur d'activité", value=(pending_request or {}).get("secteur", ""))
             adresse = c1.text_area("Adresse complète *", value=(pending_request or {}).get("adresse_entreprise", ""), height=80)
             wilaya = c2.text_input("Wilaya / commune", value=(pending_request or {}).get("wilaya_entreprise", ""))
             tel_ent = c1.text_input("Téléphone de l'entreprise", value=(pending_request or {}).get("telephone_entreprise", ""))
             email_ent = c2.text_input("E-mail de l'entreprise", value=(pending_request or {}).get("email_entreprise", ""))
             responsable = c1.text_input("Nom du responsable d'accueil", value=(pending_request or {}).get("responsable", ""))
             fonction = c2.text_input("Fonction du responsable", value=(pending_request or {}).get("fonction_responsable", ""))
-            sujet = st.text_input("Sujet / intitulé du stage *", value=(pending_request or {}).get("sujet_stage", ""))
-            domaine = st.text_input("Service ou domaine d'affectation")
+            domaine = st.text_input("Service ou domaine d'affectation", value=(pending_request or {}).get("domaine_stage", ""))
             superviseur = st.selectbox("Enseignant chargé de superviser le stage (Permanent uniquement) *",
                                        options=permanent_teachers, index=(permanent_teachers.index(pending_request.get("enseignant_superviseur")) if pending_request and pending_request.get("enseignant_superviseur") in permanent_teachers else 0),
                                        help="La liste est extraite du fichier des enseignants et filtrée sur la qualité Permanent.")
@@ -1533,7 +1578,6 @@ if page == "Demande de stage":
             if companion_errors: errors.append("Corrigez les matricules des camarades avant de continuer.")
             if not entreprise.strip(): errors.append("Le nom de l'entreprise est obligatoire.")
             if not adresse.strip(): errors.append("L'adresse de l'entreprise est obligatoire.")
-            if not sujet.strip(): errors.append("Le sujet du stage est obligatoire.")
             if not programme.strip(): errors.append("Le programme détaillé du stage est obligatoire.")
             if not superviseur.strip(): errors.append("Veuillez choisir un enseignant superviseur permanent.")
             if superviseur not in permanent_teachers: errors.append("L'enseignant choisi doit être un Permanent.")
@@ -1566,9 +1610,9 @@ if page == "Demande de stage":
                 main_ccp = ccp_by_key.get(main_key_, "")  # colonnes historiques de `demandes` = demandeur principal
                 main_cheque = sqlite3.Binary(cheque_by_key[main_key_]) if cheque_by_key.get(main_key_) else None
                 req = {"departement": DEPARTEMENT_ACTUEL,
-                       "entreprise":entreprise.strip(),"secteur":secteur.strip(),"adresse":adresse.strip(),
+                       "entreprise":entreprise.strip(),"secteur":"","adresse":adresse.strip(),
                        "wilaya":wilaya.strip(),"tel_ent":tel_ent.strip(),"email_ent":email_ent.strip(),
-                       "responsable":responsable.strip(),"fonction":fonction.strip(),"sujet":sujet.strip(),
+                       "responsable":responsable.strip(),"fonction":fonction.strip(),"sujet":"",
                        "domaine":domaine.strip(),
                        # Ces deux champs sont obligatoires dans le PDF et en base.
                        "superviseur":superviseur.strip(),
@@ -1595,9 +1639,18 @@ if page == "Demande de stage":
                             groupe=?,sous_groupe=?,telephone=?,email=?,entreprise=?,secteur=?,adresse_entreprise=?,wilaya_entreprise=?,
                             telephone_entreprise=?,email_entreprise=?,responsable=?,fonction_responsable=?,sujet_stage=?,domaine_stage=?,
                             enseignant_superviseur=?,programme_stage=?,date_debut=?,date_fin=?,observations=?,wilaya_residence=?,
-                            ville_naissance=?,wilaya_naissance=?,date_naissance=?,lieu_naissance=?,participants_json=?,date_soumission=?,
+                            ville_naissance=?,wilaya_naissance=?,date_naissance=?,lieu_naissance=?,participants_json=?,date_soumission=COALESCE(date_soumission,?),
                             ccp_number=?,cheque_barre=COALESCE(?,cheque_barre),adresse_domicile=?,
-                            statut='En attente du document signé' WHERE id=?""", values + (main_ccp, main_cheque, main_student.get("adresse_domicile", ""), rid))
+                            signed_pdf=NULL, signed_upload_date=NULL, chef_avis=NULL, chef_avis_date=NULL,
+                            chef_observation=NULL, statut='En attente du document signé' WHERE id=?""", values + (main_ccp, main_cheque, main_student.get("adresse_domicile", ""), rid))
+                        edit_auth_row = con.execute("SELECT matricule_key, motif FROM autorisations_modification WHERE demande_id=?", (rid,)).fetchone()
+                        con.execute("UPDATE dossiers_etudiants SET vice_dean_avis=NULL, vice_dean_date=NULL, vice_dean_comment=NULL WHERE demande_id=?", (rid,))
+                        con.execute("INSERT INTO historique_evenements (demande_id,matricule,nom,prenom,evenement,date_evenement,auteur,avis_associe,details) VALUES (?,?,?,?,?,?,?,?,?)",
+                            (rid, main_student.get("matricule", ""), main_student.get("nom", ""), main_student.get("prenom", ""),
+                             "Demande modifiée par l'étudiant après autorisation du Chef", datetime.now().isoformat(timespec="seconds"),
+                             "Étudiant", "Avis précédents réinitialisés — nouvelle signature et nouveaux avis requis",
+                             (edit_auth_row[1] if edit_auth_row else "") or "Modification autorisée"))
+                        con.execute("DELETE FROM autorisations_modification WHERE demande_id=?", (rid,))
                     else:
                         cur = con.execute("""INSERT INTO demandes (date_soumission,departement,matricule,nom,prenom,nom_arabe,prenom_arabe,
                             promotion,groupe,sous_groupe,telephone,email,entreprise,secteur,adresse_entreprise,wilaya_entreprise,
@@ -1673,8 +1726,11 @@ if page == "Demande de stage":
                             st.error("Le fichier téléversé ne semble pas être un PDF valide.")
                         else:
                             with sqlite3.connect(DB_FILE) as con:
+                                upload_stamp = datetime.now().isoformat(timespec="seconds")
                                 con.execute("UPDATE demandes SET signed_pdf=?, signed_upload_date=?, statut=? WHERE id=?",
-                                            (sqlite3.Binary(content), datetime.now().isoformat(timespec="seconds"), "En attente de l’avis du Chef de département", active_id))
+                                            (sqlite3.Binary(content), upload_stamp, "En attente de l’avis du Chef de département", active_id))
+                                con.execute("INSERT INTO historique_evenements (demande_id,matricule,nom,prenom,evenement,date_evenement,auteur,details) SELECT id,matricule,nom,prenom,'Document signé téléversé',?,'Étudiant','Nouvelle version signée déposée' FROM demandes WHERE id=?",
+                                            (upload_stamp, active_id))
                                 con.commit()
                             st.session_state.pop("active_request_id",None)
                             st.session_state.pop("active_pdf",None)
@@ -1682,24 +1738,42 @@ if page == "Demande de stage":
                             st.info("Votre demande signée est enregistrée et reste en attente de l’avis du Chef de département. Elle est visible dans les espaces Étudiant, Chef de département, Vice-doyen et Administration.")
     elif main_student and selected_stage_type == "Visite en entreprise":
         st.markdown('<div class="section">2. Demande de visite en entreprise</div>', unsafe_allow_html=True)
-        st.info("Votre demande est traitée comme une visite en entreprise. Le document officiel Visite.docx sera généré automatiquement dès l'envoi.")
+        with sqlite3.connect(DB_FILE) as con_visit_lookup:
+            visit_pending_row = con_visit_lookup.execute("""SELECT r.* FROM demandes r
+                LEFT JOIN autorisations_modification a ON a.demande_id=r.id
+                WHERE r.matricule=? AND r.type_demande='Visite en entreprise'
+                  AND (r.signed_pdf IS NULL OR a.demande_id IS NOT NULL)
+                ORDER BY CASE WHEN a.demande_id IS NOT NULL THEN 0 ELSE 1 END, r.id DESC LIMIT 1""",
+                (normalize_matricule(main_student['matricule']),)).fetchone()
+            visit_cols = [x[1] for x in con_visit_lookup.execute("PRAGMA table_info(demandes)")]
+        visit_pending = dict(zip(visit_cols, visit_pending_row)) if visit_pending_row else None
+        visit_edit_authorized = False
+        if visit_pending:
+            with sqlite3.connect(DB_FILE) as con_visit_auth:
+                visit_edit_authorized = con_visit_auth.execute("SELECT 1 FROM autorisations_modification WHERE demande_id=?", (visit_pending['id'],)).fetchone() is not None
+            if visit_pending.get('signed_pdf') and visit_edit_authorized:
+                st.warning("Le Chef de département a autorisé la modification de cette visite. Après modification, vous devrez télécharger et téléverser à nouveau le document signé.")
+            elif not visit_pending.get('signed_pdf'):
+                st.info("Votre demande de visite déjà enregistrée est reprise ci-dessous. Vous pouvez compléter ou corriger les renseignements avant le dépôt du document signé.")
+        else:
+            st.info("Votre demande est traitée comme une visite en entreprise. Le document officiel Visite.docx sera généré automatiquement dès l'envoi.")
         with st.form("visit_form"):
             st.markdown("**Vérification et renseignements personnels du candidat**")
             vc1, vc2 = st.columns(2)
-            v_nom = vc1.text_input("Nom *", value=main_student.get("nom", ""))
-            v_prenom = vc2.text_input("Prénom *", value=main_student.get("prenom", ""))
-            v_birth = vc1.text_input("Date de naissance *", value=main_student.get("date_naissance", ""), placeholder="JJ/MM/AAAA")
-            v_birth_place = vc2.text_input("Lieu de naissance *", value=main_student.get("lieu_naissance", ""))
-            v_niveau = vc1.text_input("Niveau *", value=main_student.get("promotion", ""))
+            v_nom = vc1.text_input("Nom *", value=(visit_pending or {}).get("nom", main_student.get("nom", "")))
+            v_prenom = vc2.text_input("Prénom *", value=(visit_pending or {}).get("prenom", main_student.get("prenom", "")))
+            v_birth = vc1.text_input("Date de naissance *", value=(visit_pending or {}).get("date_naissance", main_student.get("date_naissance", "")), placeholder="JJ/MM/AAAA")
+            v_birth_place = vc2.text_input("Lieu de naissance *", value=(visit_pending or {}).get("lieu_naissance", main_student.get("lieu_naissance", "")))
+            v_niveau = vc1.text_input("Niveau *", value=(visit_pending or {}).get("niveau", main_student.get("promotion", "")))
             v_diploma = vc2.text_input("Diplôme préparé *", value="Licence" if norm_promo(main_student.get("promotion","")).startswith(("L","MCIL")) else "Master / Ingénieur")
-            v_speciality = st.text_input("Spécialité *", value="Électrotechnique" if "ELT" in norm_promo(main_student.get("promotion","")) or "MCIL" in norm_promo(main_student.get("promotion","")) else "")
+            v_speciality = st.text_input("Spécialité *", value=(visit_pending or {}).get("specialite") or ("Électrotechnique" if "ELT" in norm_promo(main_student.get("promotion","")) or "MCIL" in norm_promo(main_student.get("promotion","")) else ""))
             st.markdown("**Entreprise d'accueil et période de visite**")
             ve1, ve2 = st.columns(2)
-            v_ent = ve1.text_input("Dénomination de l'entreprise *")
-            v_wilaya = ve2.text_input("Wilaya de l'entreprise *")
+            v_ent = ve1.text_input("Dénomination de l'entreprise *", value=(visit_pending or {}).get("entreprise", ""))
+            v_wilaya = ve2.text_input("Wilaya de l'entreprise *", value=(visit_pending or {}).get("wilaya_entreprise", ""))
             vd1, vd2 = st.columns(2)
-            v_start = vd1.date_input("Date de début de la visite *", value=date.today())
-            v_end = vd2.date_input("Date de fin de la visite *", value=date.today() + timedelta(days=1))
+            v_start = vd1.date_input("Date de début de la visite *", value=(date.fromisoformat(str(visit_pending.get("date_debut"))[:10]) if visit_pending and visit_pending.get("date_debut") else date.today()))
+            v_end = vd2.date_input("Date de fin de la visite *", value=(date.fromisoformat(str(visit_pending.get("date_fin"))[:10]) if visit_pending and visit_pending.get("date_fin") else date.today() + timedelta(days=1)))
             v_submit = st.form_submit_button("📨 Envoyer la demande et générer Visite.docx", use_container_width=True)
         if v_submit:
             errors = []
@@ -1734,20 +1808,35 @@ if page == "Demande de stage":
                     st.error(f"Impossible de générer le document Visite.docx : {exc}")
                 else:
                     with sqlite3.connect(DB_FILE) as con:
-                        cur = con.execute("""INSERT INTO demandes
-                            (date_soumission,matricule,nom,prenom,promotion,date_naissance,lieu_naissance,
-                             entreprise,wilaya_entreprise,date_debut,date_fin,type_demande,participants_json,
-                             statut,niveau,diplome_prepare,specialite,visite_docx,visite_date_generation)
-                            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                            (generation_dt.isoformat(timespec="seconds"), main_student["matricule"],
-                             visit_data["nom"], visit_data["prenom"], main_student["promotion"],
-                             visit_data["date_naissance"], visit_data["lieu_naissance"], visit_data["entreprise"],
-                             visit_data["wilaya_entreprise"], v_start.isoformat(), v_end.isoformat(),
-                             "Visite en entreprise", json.dumps([main_student], ensure_ascii=False),
-                             "Demande de visite transmise au Chef de département",
-                             visit_data["niveau"], visit_data["diplome_prepare"], visit_data["specialite"],
-                             sqlite3.Binary(visit_docx), generation_dt.isoformat(timespec="minutes")))
-                        visit_id = cur.lastrowid
+                        if visit_pending:
+                            visit_id = int(visit_pending["id"])
+                            con.execute("""UPDATE demandes SET nom=?,prenom=?,date_naissance=?,lieu_naissance=?,
+                                entreprise=?,wilaya_entreprise=?,date_debut=?,date_fin=?,niveau=?,diplome_prepare=?,
+                                specialite=?,visite_docx=?,visite_date_generation=?,signed_pdf=NULL,signed_upload_date=NULL,
+                                chef_avis=NULL,chef_avis_date=NULL,chef_observation=NULL,
+                                statut='Document de visite à signer' WHERE id=? AND type_demande='Visite en entreprise'""",
+                                (visit_data["nom"], visit_data["prenom"], visit_data["date_naissance"], visit_data["lieu_naissance"],
+                                 visit_data["entreprise"], visit_data["wilaya_entreprise"], v_start.isoformat(), v_end.isoformat(),
+                                 visit_data["niveau"], visit_data["diplome_prepare"], visit_data["specialite"], sqlite3.Binary(visit_docx),
+                                 generation_dt.isoformat(timespec="minutes"), visit_id))
+                            con.execute("INSERT INTO historique_evenements (demande_id,matricule,nom,prenom,evenement,date_evenement,auteur,avis_associe,details) VALUES (?,?,?,?,?,?,?,?,?)",
+                                (visit_id, main_student["matricule"], visit_data["nom"], visit_data["prenom"], "Demande de visite modifiée par l'étudiant", generation_dt.isoformat(timespec="seconds"), "Étudiant", "Avis précédent réinitialisé — nouvelle signature requise", "Modification avec autorisation du Chef" if visit_edit_authorized else "Mise à jour avant dépôt du document signé"))
+                            con.execute("DELETE FROM autorisations_modification WHERE demande_id=?", (visit_id,))
+                        else:
+                            cur = con.execute("""INSERT INTO demandes
+                                (date_soumission,matricule,nom,prenom,promotion,date_naissance,lieu_naissance,
+                                 entreprise,wilaya_entreprise,date_debut,date_fin,type_demande,participants_json,
+                                 statut,niveau,diplome_prepare,specialite,visite_docx,visite_date_generation)
+                                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                                (generation_dt.isoformat(timespec="seconds"), main_student["matricule"],
+                                 visit_data["nom"], visit_data["prenom"], main_student["promotion"],
+                                 visit_data["date_naissance"], visit_data["lieu_naissance"], visit_data["entreprise"],
+                                 visit_data["wilaya_entreprise"], v_start.isoformat(), v_end.isoformat(),
+                                 "Visite en entreprise", json.dumps([main_student], ensure_ascii=False),
+                                 "Demande de visite transmise au Chef de département",
+                                 visit_data["niveau"], visit_data["diplome_prepare"], visit_data["specialite"],
+                                 sqlite3.Binary(visit_docx), generation_dt.isoformat(timespec="minutes")))
+                            visit_id = cur.lastrowid
                         con.commit()
                     st.session_state["last_visit_id"] = int(visit_id)
                     st.session_state["last_visit_docx"] = visit_docx
@@ -1769,8 +1858,10 @@ if page == "Demande de stage":
                     st.error("Le fichier téléversé ne semble pas être un PDF valide.")
                 elif st.button("📨 Déposer le document de visite signé", type="primary", key=f"submit_signed_visit_{visit_id}"):
                     with sqlite3.connect(DB_FILE) as con:
+                        visit_upload_stamp = datetime.now().isoformat(timespec="seconds")
                         con.execute("UPDATE demandes SET signed_pdf=?, signed_upload_date=?, statut=? WHERE id=? AND type_demande='Visite en entreprise'",
-                            (sqlite3.Binary(signed_visit.getvalue()), datetime.now().isoformat(timespec="seconds"), "Document de visite signé déposé — en attente de l’avis du Chef de département", visit_id))
+                            (sqlite3.Binary(signed_visit.getvalue()), visit_upload_stamp, "Document de visite signé déposé — en attente de l’avis du Chef de département", visit_id))
+                        con.execute("INSERT INTO historique_evenements (demande_id,matricule,nom,prenom,evenement,date_evenement,auteur,details) SELECT id,matricule,nom,prenom,'Document de visite signé téléversé',?,'Étudiant','Document signé déposé' FROM demandes WHERE id=?", (visit_upload_stamp, visit_id))
                         con.commit()
                     st.success("Le document signé a été déposé. Il est maintenant visible dans l'historique des espaces administratifs.")
                     st.rerun()
@@ -1934,6 +2025,12 @@ elif page == "Administration":
             st.success("Nettoyage terminé : toutes les demandes et tous les historiques de la base ont été supprimés.")
             st.rerun()
 
+        with sqlite3.connect(DB_FILE) as con_evt_admin:
+            admin_events = pd.read_sql_query("SELECT demande_id AS reference_interne, matricule, nom, prenom, evenement, date_evenement, auteur, avis_associe, details FROM historique_evenements ORDER BY date_evenement DESC", con_evt_admin)
+        st.markdown("### 🕘 Historique des modifications, autorisations et avis")
+        st.dataframe(admin_events, use_container_width=True, hide_index=True)
+        st.download_button("📥 Télécharger le journal des modifications (Excel)", df_to_excel_bytes(admin_events, "Journal modifications"), "Journal_modifications_FGE_2026-2027.xlsx", XLSX_MIME, key="admin_events_excel")
+
         if data.empty: st.info("Aucune demande enregistrée.")
         else:
             def participants_label(raw):
@@ -2032,6 +2129,11 @@ elif page == "Chef de département":
         st.dataframe(chef_history, use_container_width=True, hide_index=True)
         st.download_button("📊 Télécharger l'historique complet (Excel)", df_to_excel_bytes(chef_history, "Historique complet"),
             "Historique_complet_demandeurs_FGE_2026-2027.xlsx", XLSX_MIME, key="chef_history_all")
+        with sqlite3.connect(DB_FILE) as con_evt:
+            chef_events = pd.read_sql_query("SELECT demande_id AS reference_interne, matricule, nom, prenom, evenement, date_evenement, auteur, avis_associe, details FROM historique_evenements ORDER BY date_evenement DESC", con_evt)
+        st.markdown("### 🕘 Historique des modifications et autorisations")
+        st.dataframe(chef_events, use_container_width=True, hide_index=True)
+        st.download_button("📥 Télécharger le journal des modifications (Excel)", df_to_excel_bytes(chef_events, "Journal modifications"), "Journal_modifications_FGE_2026-2027.xlsx", XLSX_MIME, key="chef_events_excel")
         if chef_data.empty:
             st.info("Aucune demande de stage.")
         else:
@@ -2060,6 +2162,17 @@ elif page == "Chef de département":
                 elif avis_stage_chef == AVIS_CHEF_DEF:
                     st.error(f"Avis défavorable du Chef de département enregistré le {rec.get('chef_avis_date') or '—'}.")
                 observation_stage_chef = st.text_area("Observation du Chef de département", value=rec.get("chef_observation") or "", key=f"chef_stage_comment_{selected_chef}")
+                # Le Chef peut autoriser explicitement une édition, même après un avis favorable.
+                edit_reason = st.text_input("Motif de l'autorisation de modification (facultatif)", key=f"chef_edit_reason_{selected_chef}")
+                if st.button("✏️ Autoriser l'étudiant à modifier cette demande", key=f"chef_allow_edit_{selected_chef}"):
+                    with sqlite3.connect(DB_FILE) as con_edit:
+                        con_edit.execute("INSERT INTO autorisations_modification (demande_id,matricule_key,autorise_le,autorise_par,motif) VALUES (?,?,?,?,?) ON CONFLICT(demande_id) DO UPDATE SET matricule_key=excluded.matricule_key,autorise_le=excluded.autorise_le,autorise_par=excluded.autorise_par,motif=excluded.motif",
+                            (selected_chef, normalize_matricule(rec.get("matricule", "")), datetime.now().isoformat(timespec="seconds"), "Chef de département", edit_reason.strip()))
+                        con_edit.execute("INSERT INTO historique_evenements (demande_id,matricule,nom,prenom,evenement,date_evenement,auteur,avis_associe,details) VALUES (?,?,?,?,?,?,?,?,?)",
+                            (selected_chef, rec.get("matricule", ""), rec.get("nom", ""), rec.get("prenom", ""), "Modification autorisée par le Chef de département", datetime.now().isoformat(timespec="seconds"), "Chef de département", rec.get("chef_avis") or "En attente", edit_reason.strip()))
+                        con_edit.commit()
+                    st.success("Autorisation enregistrée. L'étudiant pourra modifier sa demande lors de sa prochaine connexion avec son matricule.")
+                    st.rerun()
                 cs1, cs2 = st.columns(2)
                 stage_chef_fav = cs1.button("✅ Avis favorable du Chef", type="primary", key=f"chef_stage_fav_{selected_chef}", use_container_width=True)
                 stage_chef_def = cs2.button("❌ Avis défavorable du Chef", key=f"chef_stage_def_{selected_chef}", use_container_width=True)
@@ -2071,6 +2184,8 @@ elif page == "Chef de département":
                     with sqlite3.connect(DB_FILE) as con_dec:
                         con_dec.execute("UPDATE demandes SET chef_avis=?, chef_avis_date=?, chef_observation=?, statut=? WHERE id=?",
                                         (decision_chef, date_decision_chef, observation_stage_chef.strip(), statut_chef, selected_chef))
+                        con_dec.execute("INSERT INTO historique_evenements (demande_id,matricule,nom,prenom,evenement,date_evenement,auteur,avis_associe,details) VALUES (?,?,?,?,?,?,?,?,?)",
+                            (selected_chef, rec.get("matricule", ""), rec.get("nom", ""), rec.get("prenom", ""), "Avis du Chef de département enregistré", date_decision_chef, "Chef de département", decision_chef, observation_stage_chef.strip()))
                         con_dec.commit()
                     st.success("Avis du Chef de département enregistré dans l'historique partagé.")
                     st.rerun()
@@ -2201,6 +2316,16 @@ elif page == "Chef de département":
                 observation_chef = st.text_area("Observation du Chef de département",
                     value=selected_visit_row.get("chef_observation") or "",
                     key=f"chef_visit_comment_{selected_visit}")
+                visit_edit_reason = st.text_input("Motif d'autorisation de modification (visite)", key=f"chef_visit_edit_reason_{selected_visit}")
+                if st.button("✏️ Autoriser la modification de cette visite", key=f"chef_visit_allow_edit_{selected_visit}"):
+                    with sqlite3.connect(DB_FILE) as con_edit_visit:
+                        con_edit_visit.execute("INSERT INTO autorisations_modification (demande_id,matricule_key,autorise_le,autorise_par,motif) VALUES (?,?,?,?,?) ON CONFLICT(demande_id) DO UPDATE SET matricule_key=excluded.matricule_key,autorise_le=excluded.autorise_le,autorise_par=excluded.autorise_par,motif=excluded.motif",
+                            (selected_visit, normalize_matricule(selected_visit_row.get("matricule", "")), datetime.now().isoformat(timespec="seconds"), "Chef de département", visit_edit_reason.strip()))
+                        con_edit_visit.execute("INSERT INTO historique_evenements (demande_id,matricule,nom,prenom,evenement,date_evenement,auteur,avis_associe,details) VALUES (?,?,?,?,?,?,?,?,?)",
+                            (selected_visit, selected_visit_row.get("matricule", ""), selected_visit_row.get("nom", ""), selected_visit_row.get("prenom", ""), "Modification de visite autorisée par le Chef", datetime.now().isoformat(timespec="seconds"), "Chef de département", selected_visit_row.get("chef_avis") or "En attente", visit_edit_reason.strip()))
+                        con_edit_visit.commit()
+                    st.success("L'étudiant est autorisé à modifier cette visite.")
+                    st.rerun()
                 ca1, ca2 = st.columns(2)
                 chef_fav = ca1.button("✅ Accorder l'avis favorable", type="primary",
                     key=f"chef_visit_fav_{selected_visit}", use_container_width=True)
@@ -2209,12 +2334,15 @@ elif page == "Chef de département":
                 if chef_fav or chef_def:
                     new_chef_avis = AVIS_CHEF_FAV if chef_fav else AVIS_CHEF_DEF
                     with sqlite3.connect(DB_FILE) as con:
+                        visit_decision_date = datetime.now().isoformat(timespec="seconds")
                         con.execute("""UPDATE demandes SET chef_avis=?, chef_avis_date=?, chef_observation=?, statut=?
                             WHERE id=? AND type_demande='Visite en entreprise'""",
-                            (new_chef_avis, datetime.now().isoformat(timespec="minutes"),
+                            (new_chef_avis, visit_decision_date,
                              observation_chef.strip(),
                              "Avis favorable du Chef de département" if chef_fav else "Avis défavorable du Chef de département",
                              selected_visit))
+                        con.execute("INSERT INTO historique_evenements (demande_id,matricule,nom,prenom,evenement,date_evenement,auteur,avis_associe,details) VALUES (?,?,?,?,?,?,?,?,?)",
+                            (selected_visit, selected_visit_row.get("matricule", ""), selected_visit_row.get("nom", ""), selected_visit_row.get("prenom", ""), "Avis du Chef enregistré pour une visite", visit_decision_date, "Chef de département", new_chef_avis, observation_chef.strip()))
                         con.commit()
                     st.success("Décision du Chef de département enregistrée. Aucun avis du Vice-doyen n'est requis pour une visite.")
                     st.rerun()
@@ -2263,6 +2391,11 @@ elif page == "Vice-doyen":
         st.dataframe(vd_history, use_container_width=True, hide_index=True)
         st.download_button("📊 Télécharger l'historique complet (Excel)", df_to_excel_bytes(vd_history, "Historique complet"),
             "Historique_complet_demandeurs_FGE_2026-2027.xlsx", XLSX_MIME, key="vd_history_all")
+        with sqlite3.connect(DB_FILE) as con_evt_vd:
+            vd_events = pd.read_sql_query("SELECT demande_id AS reference_interne, matricule, nom, prenom, evenement, date_evenement, auteur, avis_associe, details FROM historique_evenements ORDER BY date_evenement DESC", con_evt_vd)
+        st.markdown("### 🕘 Historique des modifications et autorisations")
+        st.dataframe(vd_events, use_container_width=True, hide_index=True)
+        st.download_button("📥 Télécharger le journal des modifications (Excel)", df_to_excel_bytes(vd_events, "Journal modifications"), "Journal_modifications_FGE_2026-2027.xlsx", XLSX_MIME, key="vd_events_excel")
         if vd_data.empty:
             st.info("Aucun dossier n'attend un avis du Vice-doyen.")
         else:
@@ -2311,9 +2444,12 @@ elif page == "Vice-doyen":
                         nouvel_avis = AVIS_FAV if click_fav else AVIS_DEF
                         with sqlite3.connect(DB_FILE) as con:
                             # Seul CET étudiant est concerné : les autres dossiers de la demande restent inchangés.
+                            vd_decision_stamp = datetime.now().isoformat(timespec="seconds")
                             con.execute("""UPDATE dossiers_etudiants SET vice_dean_avis=?, vice_dean_date=?, vice_dean_comment=?
-                                WHERE id=?""", (nouvel_avis, datetime.now().isoformat(timespec="minutes"),
+                                WHERE id=?""", (nouvel_avis, vd_decision_stamp,
                                                 comment_vd, selected_vd))
+                            con.execute("INSERT INTO historique_evenements (demande_id,matricule,nom,prenom,evenement,date_evenement,auteur,avis_associe,details) VALUES (?,?,?,?,?,?,?,?,?)",
+                                (int(row_vd[3]), row_vd[2], row_vd[5], row_vd[6], "Avis du Vice-doyen enregistré", vd_decision_stamp, "Vice-doyen", nouvel_avis, comment_vd))
                             refresh_request_status(con, int(row_vd[3]))
                             con.commit()
                         if click_fav:
