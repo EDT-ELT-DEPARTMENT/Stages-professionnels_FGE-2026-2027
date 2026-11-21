@@ -1161,6 +1161,39 @@ if page == "Demande de stage":
                 if (my_df["Avis du Vice-doyen"] == AVIS_DEF).any():
                     st.info("Un avis défavorable a été rendu pour une de vos demandes précédentes : vous pouvez déposer une nouvelle demande.")
 
+            # Documents de stage préremplis et téléchargeables immédiatement par l'étudiant.
+            with sqlite3.connect(DB_FILE) as con_docs:
+                latest_stage = con_docs.execute("""SELECT r.id, r.type_demande, r.entreprise, r.statut,
+                    d.documents_docx, d.documents_date, d.matricule
+                    FROM demandes r JOIN dossiers_etudiants d ON d.demande_id=r.id
+                    WHERE d.matricule_key=? AND r.type_demande IN ('Stage rémunéré','Stage non rémunéré')
+                    ORDER BY r.id DESC LIMIT 1""", (normalize_matricule(main_student["matricule"]),)).fetchone()
+            if latest_stage and latest_stage[4]:
+                with st.expander("📄 Mes documents de stage préremplis — téléchargement immédiat", expanded=True):
+                    st.success("Vos trois documents sont disponibles dès maintenant. Vous n'avez pas à attendre les avis administratifs pour les télécharger.")
+                    st.write(f"**Référence :** {reference_demande(latest_stage[0], latest_stage[1])} | **Entreprise :** {latest_stage[2] or '—'}")
+                    st.download_button("⬇️ Télécharger les trois documents (Attestation d’assiduité, Convention de stage et Attestation de stage)",
+                        bytes(latest_stage[4]),
+                        f"Documents_{reference_demande(latest_stage[0], latest_stage[1])}_{normalize_matricule(main_student['matricule'])}.docx",
+                        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                        key=f"student_stage_bundle_{latest_stage[0]}_{normalize_matricule(main_student['matricule'])}",
+                        use_container_width=True)
+                    st.caption(f"Générés le : {latest_stage[5] or '—'} | Statut administratif : {latest_stage[3] or '—'}")
+
+            # Historique global personnel : stages ET visites, avec statut du document signé.
+            with sqlite3.connect(DB_FILE) as con_hist:
+                all_my_requests = pd.read_sql_query("""SELECT id, date_soumission, type_demande, entreprise,
+                    sujet_stage, date_debut, date_fin, statut, signed_pdf IS NOT NULL AS document_signe,
+                    chef_avis, chef_avis_date FROM demandes WHERE matricule=? ORDER BY id DESC""",
+                    con_hist, params=(main_student["matricule"],))
+            if not all_my_requests.empty:
+                with st.expander("🗂️ Historique complet de mes demandes (stages et visites)"):
+                    st.dataframe(all_my_requests, use_container_width=True, hide_index=True)
+                    st.download_button("📊 Télécharger mon historique complet (Excel)",
+                        df_to_excel_bytes(all_my_requests, "Mon historique"),
+                        f"Historique_demandes_{normalize_matricule(main_student['matricule'])}.xlsx",
+                        XLSX_MIME, key=f"student_all_history_{normalize_matricule(main_student['matricule'])}")
+
             # Blocage INDIVIDUEL : seul l'étudiant ayant lui-même reçu un avis favorable est bloqué.
             # Le co-stagiaire d'un binôme n'est pas concerné tant que son propre dossier n'a pas d'avis favorable.
             matricule_key = normalize_matricule(main_student["matricule"])
@@ -1470,6 +1503,29 @@ if page == "Demande de stage":
                         rid = cur.lastrowid
                     # Dossiers individuels : un CCP et un chèque barré par étudiant.
                     save_dossiers(con, rid, participants, cheque_by_key)
+                    # Les trois documents institutionnels sont générés dès la demande,
+                    # sans attendre l'avis du Chef de département ou du Vice-doyen.
+                    # Chaque étudiant reçoit son propre jeu de documents préremplis.
+                    request_for_docs = {
+                        "entreprise": req["entreprise"],
+                        "adresse_entreprise": req["adresse"],
+                        "wilaya_entreprise": req["wilaya"],
+                        "date_debut": req["debut"],
+                        "date_fin": req["fin"],
+                        "type_demande": selected_stage_type,
+                    }
+                    for participant in participants:
+                        participant_key = normalize_matricule(participant.get("matricule", ""))
+                        if not participant_key:
+                            continue
+                        participant_doc = dict(participant)
+                        participant_doc.setdefault("adresse_domicile", main_student.get("adresse_domicile", "")
+                            if participant_key == normalize_matricule(main_student.get("matricule", "")) else "")
+                        bundle = build_three_stage_documents(request_for_docs, participant_doc, len(participants))
+                        con.execute("""UPDATE dossiers_etudiants
+                            SET documents_docx=?, documents_date=?
+                            WHERE demande_id=? AND matricule_key=?""",
+                            (sqlite3.Binary(bundle), datetime.now().isoformat(timespec="minutes"), rid, participant_key))
                     if selected_stage_type == "Stage non rémunéré":
                         # Aucun CCP ni chèque barré ne doit être demandé/conservé pour un stage non rémunéré.
                         con.execute("UPDATE dossiers_etudiants SET ccp_number='', cheque_barre=NULL WHERE demande_id=?", (rid,))
@@ -1597,7 +1653,21 @@ if page == "Demande de stage":
                 file_name=f"Visite_FGE_VIS-{visit_id:05d}.docx",
                 mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                 use_container_width=True)
-            st.caption("Date de génération automatiquement inscrite dans le document. La demande est en attente de l'avis du Chef de département.")
+            st.caption("Date de génération automatiquement inscrite dans le document. Vous pouvez télécharger le document sans attendre l'avis du Chef de département.")
+            signed_visit = st.file_uploader("Téléverser le document de visite après signature (PDF uniquement)",
+                type=["pdf"], key=f"signed_visit_{visit_id}")
+            if signed_visit is not None:
+                if signed_visit.size > 15 * 1024 * 1024:
+                    st.error("Le fichier dépasse la limite de 15 Mo.")
+                elif not signed_visit.getvalue().startswith(b"%PDF"):
+                    st.error("Le fichier téléversé ne semble pas être un PDF valide.")
+                elif st.button("📨 Déposer le document de visite signé", type="primary", key=f"submit_signed_visit_{visit_id}"):
+                    with sqlite3.connect(DB_FILE) as con:
+                        con.execute("UPDATE demandes SET signed_pdf=?, statut=? WHERE id=? AND type_demande='Visite en entreprise'",
+                            (sqlite3.Binary(signed_visit.getvalue()), "Document de visite signé déposé — en attente du Chef de département", visit_id))
+                        con.commit()
+                    st.success("Le document signé a été déposé. Il est maintenant visible dans l'historique des espaces administratifs.")
+                    st.rerun()
 
 elif page == "Administration":
     st.title("Administration — Suivi des demandes")
@@ -1611,6 +1681,7 @@ elif page == "Administration":
                 wilaya_residence,ville_naissance,wilaya_naissance,date_naissance,lieu_naissance,enseignant_superviseur,programme_stage,
                 entreprise,sujet_stage,type_demande,statut,participants_json FROM demandes ORDER BY id DESC""",con)
         st.metric("Nombre total de demandes",len(data))
+        st.caption("Historique global : toutes les demandes enregistrées (stages et visites), y compris celles dont le document signé n'a pas encore été téléversé.")
 
         # Liste administrative distincte des demandeurs de visite en entreprise.
         st.markdown("### 📋 Liste des demandeurs de visite en entreprise (Excel)")
@@ -1841,6 +1912,12 @@ elif page == "Chef de département":
             ensure_all_dossiers(con)
             con.commit()
             chef_data = pd.read_sql_query("SELECT id, date_soumission, matricule, nom, prenom, entreprise, sujet_stage, statut, type_demande FROM demandes WHERE type_demande IN ('Stage rémunéré','Stage non rémunéré') ORDER BY id DESC", con)
+        with sqlite3.connect(DB_FILE) as con_hist_chef:
+            chef_history = pd.read_sql_query("SELECT id, date_soumission, matricule, nom, prenom, promotion, type_demande, entreprise, date_debut, date_fin, statut, signed_pdf IS NOT NULL AS document_signe, chef_avis, chef_avis_date FROM demandes ORDER BY id DESC", con_hist_chef)
+        st.markdown("### 🗂️ Historique complet des demandeurs — stages et visites")
+        st.dataframe(chef_history, use_container_width=True, hide_index=True)
+        st.download_button("📊 Télécharger l'historique complet (Excel)", df_to_excel_bytes(chef_history, "Historique complet"),
+            "Historique_complet_demandeurs_FGE_2026-2027.xlsx", XLSX_MIME, key="chef_history_all")
         if chef_data.empty:
             st.info("Aucune demande de stage.")
         else:
@@ -2036,6 +2113,12 @@ elif page == "Vice-doyen":
         if not vd_df.empty:
             st.download_button("📊 Excel — dossiers par étudiant et leur avis", df_to_excel_bytes(vd_df),
                                "Dossiers_et_avis_FGE_2026-2027.xlsx", XLSX_MIME, key="vd_excel")
+        with sqlite3.connect(DB_FILE) as con_hist_vd:
+            vd_history = pd.read_sql_query("SELECT id, date_soumission, matricule, nom, prenom, promotion, type_demande, entreprise, date_debut, date_fin, statut, signed_pdf IS NOT NULL AS document_signe, chef_avis, chef_avis_date FROM demandes ORDER BY id DESC", con_hist_vd)
+        st.markdown("### 🗂️ Historique complet des demandeurs — stages et visites")
+        st.dataframe(vd_history, use_container_width=True, hide_index=True)
+        st.download_button("📊 Télécharger l'historique complet (Excel)", df_to_excel_bytes(vd_history, "Historique complet"),
+            "Historique_complet_demandeurs_FGE_2026-2027.xlsx", XLSX_MIME, key="vd_history_all")
         if vd_data.empty:
             st.info("Aucun dossier n'attend un avis du Vice-doyen.")
         else:
