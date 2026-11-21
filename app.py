@@ -1059,7 +1059,31 @@ def render_stage_dashboard(students_df, db_path, prefix):
     c5.metric("Visites en entreprise", f"{visits_n:,}".replace(",", " "))
     c6.metric("Demandeurs de stage rémunéré", f"{int(remunerated_list['Matricule'].nunique()) if not remunerated_list.empty else 0:,}".replace(",", " "))
     st.markdown("#### 🎓 Étudiants éligibles au stage rémunéré par promotion")
-    st.dataframe(by_promo.style.format({"Pourcentage favorable / éligibles": "{:.2f} %"}).background_gradient(subset=["Étudiants éligibles", "Demandeurs stage rémunéré", "Avis favorables Chef"], cmap="Blues").background_gradient(subset=["Pourcentage favorable / éligibles"], cmap="Greens"), use_container_width=True, hide_index=True)
+    # Coloration native Pandas Styler, sans matplotlib : évite l'ImportError
+    # sur Streamlit Cloud lorsque matplotlib n'est pas installé.
+    def _dashboard_cell_colors(series, low_rgb, high_rgb):
+        values = pd.to_numeric(series, errors="coerce").fillna(0)
+        maximum = float(values.max()) if len(values) else 0.0
+        if maximum <= 0:
+            maximum = 1.0
+        low = tuple(int(low_rgb[i:i + 2], 16) for i in (0, 2, 4))
+        high = tuple(int(high_rgb[i:i + 2], 16) for i in (0, 2, 4))
+        css = []
+        for value in values:
+            ratio = max(0.0, min(1.0, float(value) / maximum))
+            rgb = tuple(round(low[i] + (high[i] - low[i]) * ratio) for i in range(3))
+            css.append("background-color: #{:02x}{:02x}{:02x}; color: #17324d; font-weight: 600;".format(*rgb))
+        return css
+
+    styled_by_promo = (
+        by_promo.style
+        .format({"Pourcentage favorable / éligibles": "{:.2f} %"})
+        .apply(_dashboard_cell_colors, low_rgb="eff6ff", high_rgb="93c5fd",
+               subset=["Étudiants éligibles", "Demandeurs stage rémunéré", "Avis favorables Chef"], axis=0)
+        .apply(_dashboard_cell_colors, low_rgb="f0fdf4", high_rgb="86efac",
+               subset=["Pourcentage favorable / éligibles"], axis=0)
+    )
+    st.dataframe(styled_by_promo, use_container_width=True, hide_index=True)
     st.caption("Le pourcentage est calculé uniquement pour les stages rémunérés : nombre de demandeurs ayant reçu un avis favorable du Chef de département ÷ nombre total d'étudiants éligibles dans le fichier source × 100. Les effectifs de demandeurs comptent les matricules distincts des demandeurs principaux et des camarades associés à une demande.")
     promo_sheets = {}
     for promo, part in eligible.groupby("Promotion", dropna=False):
