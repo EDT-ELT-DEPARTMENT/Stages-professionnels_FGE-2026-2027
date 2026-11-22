@@ -6,7 +6,7 @@ import os, re, sqlite3, json, io
 import html
 import base64, zlib, tempfile
 from docx import Document
-from docx.shared import Pt, RGBColor
+from docx.shared import Cm, Pt, RGBColor
 import pandas as pd
 import streamlit as st
 from reportlab.lib import colors
